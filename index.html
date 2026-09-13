@@ -324,7 +324,9 @@ const endpointStatus = {
   vegas: { label: 'Vegas Lines (Odds API)', state: 'idle', detail: 'Runs during Generate.' },
   historical: { label: 'Historical Stats (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
   weather: { label: 'Weather (Open-Meteo)', state: 'idle', detail: 'Runs during Generate.' },
-  defense: { label: 'Defense Matchups (nflverse)', state: 'idle', detail: 'Runs during Generate.' }
+  defense: { label: 'Defense Matchups (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
+  injuries: { label: 'Practice Reports (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
+  snaps: { label: 'Snap Trends (nflverse)', state: 'idle', detail: 'Runs during Generate.' }
 };
 
 function setEndpointStatus(key, state, detail){
@@ -580,10 +582,19 @@ function computeProjections(pool){
   pool.forEach(p => {
     let proj = baselineProjection(p);
 
-    // Coded injury discount (no AI — just DraftKings' own status tag).
+    // Coded injury discount (DraftKings' own status tag), refined further
+    // with real practice-participation data when we have it — a Questionable
+    // player who practiced fully all week is a very different bet than one
+    // who didn't practice at all, even though DK tags them identically.
     if(ZERO_OUT_STATUSES.has(p.injuryStatus)) proj = 0;
     else if(p.injuryStatus === 'D') proj *= 0.8;
-    else if(p.injuryStatus === 'Q' || p.injuryStatus === 'GTD') proj *= 0.93;
+    else if(p.injuryStatus === 'Q' || p.injuryStatus === 'GTD'){
+      const ps = p.practiceStatus || '';
+      if(/DID NOT PARTICIPATE|DNP/.test(ps)) proj *= 0.82;
+      else if(/LIMITED/.test(ps)) proj *= 0.90;
+      else if(/FULL/.test(ps)) proj *= 0.97;
+      else proj *= 0.93; // no practice data — fall back to the flat discount
+    }
 
     // Coded weather adjustment for outdoor stadiums, at the actual kickoff hour.
     const w = p.weather;
@@ -617,6 +628,19 @@ function computeProjections(pool){
       if(p.oppDefense && p.oppDefense.passFactor != null) proj *= p.oppDefense.passFactor;
     } else if(p.pos === 'RB'){
       if(p.oppDefense && p.oppDefense.rushFactor != null) proj *= p.oppDefense.rushFactor;
+    }
+
+    // Real DST scoring bonus from actual sack/interception production,
+    // computed from the same nflverse team-week fetch (see fetchDefenseMatchups).
+    if(p.pos === 'DST' && p.ownDefense && p.ownDefense.turnoverFactor != null){
+      proj *= p.ownDefense.turnoverFactor;
+    }
+
+    // Snap-share role trend from real PFR data — a climbing role is treated
+    // as a modest tailwind, a shrinking one as a modest headwind. Kept small
+    // since this is directional signal, not a precise multiplier.
+    if(p.snapTrend != null){
+      proj *= Math.max(0.92, Math.min(1.1, 1 + p.snapTrend * 0.5));
     }
 
     p.proj = Math.round(proj * 10) / 10;
@@ -702,6 +726,30 @@ function normalizePlayerName(name){
     .trim();
 }
 
+// Rough league-average touchdown rates, used to regress a player's actual
+// TD total halfway back toward what their yardage volume alone would
+// predict. Touchdowns are the highest-variance, least-repeatable part of a
+// box score — someone running well above or below their volume-implied rate
+// is more likely due for regression than to keep it up.
+const TD_BENCHMARK_PER_100YD = { QB: 4.5, RB: 5.0, WR: 5.0, TE: 6.0 };
+const TD_POINT_VALUE = { QB: 4 }; // DK: passing TD = 4pts, rushing/receiving TD = 6pts
+
+function regressedAvgPoints(r, games, rawPts){
+  const pos = (r.position || '').toUpperCase();
+  const benchmark = TD_BENCHMARK_PER_100YD[pos];
+  if(!benchmark) return rawPts / games; // DST or unrecognized position — leave as-is
+
+  const yards = pos === 'QB' ? Number(r.passing_yards) : (Number(r.rushing_yards) + Number(r.receiving_yards));
+  const tds = pos === 'QB' ? Number(r.passing_tds) : (Number(r.rushing_tds) + Number(r.receiving_tds));
+  if(isNaN(yards) || isNaN(tds) || yards <= 0) return rawPts / games;
+
+  const expectedTds = (yards / 100) * benchmark;
+  const regressedTds = tds * 0.5 + expectedTds * 0.5;
+  const tdPointValue = TD_POINT_VALUE[pos] || 6;
+  const adjustedTotalPts = rawPts - (tds - regressedTds) * tdPointValue;
+  return adjustedTotalPts / games;
+}
+
 // Fetches one season's file and returns { key -> { avg, games } }, or null
 // on failure (distinct from {} = fetched fine but nothing usable).
 async function fetchSeasonStatsRaw(proxy, season){
@@ -719,7 +767,43 @@ async function fetchSeasonStatsRaw(proxy, season){
       const games = Number(r.games);
       const pts = r.fantasy_points_ppr != null ? Number(r.fantasy_points_ppr) : Number(r.fantasy_points);
       if(!name || !games || isNaN(games) || isNaN(pts)) return;
-      result[normalizePlayerName(name)] = { avg: pts / games, games };
+      result[normalizePlayerName(name)] = { avg: regressedAvgPoints(r, games, pts), games };
+    });
+    return result;
+  } catch(err){
+    return null;
+  }
+}
+
+// Best-effort attempt at a genuine per-week player file, following the same
+// "_week" naming convention confirmed for team stats. Unverified — returns
+// null on any failure so callers fall back to the season-total approach.
+async function fetchWeeklyPlayerStats(proxy, season, lastNWeeks){
+  try{
+    const res = await fetch(proxy + '/nflverse/player-week?season=' + season);
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const csvText = await res.text();
+    const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
+    const rows = parsed.data || [];
+    if(!rows.length) throw new Error('CSV came back empty.');
+    if(!('week' in rows[0])) throw new Error('No week column — not actually a per-week file.');
+
+    const byPlayer = {};
+    rows.forEach(r => {
+      const name = r.player_display_name || r.player_name;
+      const week = Number(r.week);
+      const pts = r.fantasy_points_ppr != null ? Number(r.fantasy_points_ppr) : Number(r.fantasy_points);
+      if(!name || isNaN(week) || isNaN(pts)) return;
+      const key = normalizePlayerName(name);
+      if(!byPlayer[key]) byPlayer[key] = [];
+      byPlayer[key].push({ week, pts });
+    });
+
+    const result = {};
+    Object.keys(byPlayer).forEach(key => {
+      const games = byPlayer[key].sort((a, b) => b.week - a.week).slice(0, lastNWeeks);
+      if(!games.length) return;
+      result[key] = { avg: games.reduce((s, g) => s + g.pts, 0) / games.length, games: games.length };
     });
     return result;
   } catch(err){
@@ -736,39 +820,45 @@ async function fetchHistoricalStats(){
   setEndpointStatus('historical', 'pending', 'Fetching historical stats…');
   try{
     const season = new Date().getFullYear();
-    // This file holds season-to-date TOTALS, so early in a season a player's
-    // average can be based on just 1-2 games — one huge or one awful game
-    // skews it hard. Blend in last season's full-year average as a
-    // stabilizing prior, weighted down as more current-season games pile up
-    // (full weight to current-season data by ~4 games played).
+
+    // Prefer genuine per-week recency (last 4 games) if that file actually
+    // exists; otherwise fall back to season-total + prior-year blending.
+    const weekly = await fetchWeeklyPlayerStats(proxy, season, 4);
     const [current, previous] = await Promise.all([
       fetchSeasonStatsRaw(proxy, season),
       fetchSeasonStatsRaw(proxy, season - 1)
     ]);
-    if(current === null && previous === null) throw new Error('Both current- and prior-season fetches failed.');
+    if(!weekly && current === null && previous === null) throw new Error('All stats fetches failed.');
 
     const curMap = current || {};
     const prevMap = previous || {};
-    const keys = new Set([...Object.keys(curMap), ...Object.keys(prevMap)]);
+    const weeklyMap = weekly || {};
+    const keys = new Set([...Object.keys(curMap), ...Object.keys(prevMap), ...Object.keys(weeklyMap)]);
     const result = {};
     keys.forEach(key => {
+      const wk = weeklyMap[key];
       const cur = curMap[key];
       const prev = prevMap[key];
-      if(cur && prev){
+
+      if(wk && wk.games >= 2){
+        // Real recent-form data is available and has enough games to trust on its own.
+        result[key] = { avg: Math.round(wk.avg * 10) / 10, confidence: wk.games >= 3 ? 'good' : 'thin' };
+      } else if(cur && prev){
         const w = Math.min(cur.games / 4, 1);
-        result[key] = Math.round((cur.avg * w + prev.avg * (1 - w)) * 10) / 10;
+        result[key] = { avg: Math.round((cur.avg * w + prev.avg * (1 - w)) * 10) / 10, confidence: cur.games >= 3 ? 'good' : 'thin' };
       } else if(cur){
-        result[key] = Math.round(cur.avg * 10) / 10;
+        result[key] = { avg: Math.round(cur.avg * 10) / 10, confidence: cur.games >= 3 ? 'good' : 'thin' };
       } else if(prev){
-        result[key] = Math.round(prev.avg * 10) / 10;
+        result[key] = { avg: Math.round(prev.avg * 10) / 10, confidence: 'thin' }; // no current-season games at all
       }
     });
 
     historicalStatsCache = result;
-    const note = current
-      ? (Object.keys(curMap).length + ' players with current-season data' + (previous ? ', blended with prior season for thin samples' : ''))
-      : 'current-season fetch failed, using prior season only';
-    setEndpointStatus('historical', 'ok', 'Loaded ' + Object.keys(result).length + ' players (' + note + ').');
+    const usedWeekly = !!weekly;
+    setEndpointStatus('historical', 'ok',
+      'Loaded ' + Object.keys(result).length + ' players' +
+      (usedWeekly ? ' using real weekly recency data' : ' using season totals (no weekly file found — following the standard fallback)') + '.'
+    );
     return result;
   } catch(err){
     historicalStatsCache = {};
@@ -800,16 +890,28 @@ async function fetchDefenseMatchups(){
     const rows = parsed.data || [];
     if(!rows.length) throw new Error('CSV came back empty.');
 
-    const allowed = {}; // team -> { games, passYds, rushYds }
+    const allowed = {}; // team -> { games, passYds, rushYds } — what this team ALLOWS (keyed by opponent_team)
+    const ownDefense = {}; // team -> { games, sacks, ints } — this team's OWN defensive production (keyed by team)
     rows.forEach(r => {
       const defense = r.opponent_team;
       const passYds = Number(r.passing_yards);
       const rushYds = Number(r.rushing_yards);
-      if(!defense || isNaN(passYds) || isNaN(rushYds)) return;
-      if(!allowed[defense]) allowed[defense] = { games: 0, passYds: 0, rushYds: 0 };
-      allowed[defense].games++;
-      allowed[defense].passYds += passYds;
-      allowed[defense].rushYds += rushYds;
+      if(defense && !isNaN(passYds) && !isNaN(rushYds)){
+        if(!allowed[defense]) allowed[defense] = { games: 0, passYds: 0, rushYds: 0 };
+        allowed[defense].games++;
+        allowed[defense].passYds += passYds;
+        allowed[defense].rushYds += rushYds;
+      }
+
+      const ownTeam = r.team;
+      const sacks = Number(r.def_sacks);
+      const ints = Number(r.def_interceptions);
+      if(ownTeam){
+        if(!ownDefense[ownTeam]) ownDefense[ownTeam] = { games: 0, sacks: 0, ints: 0 };
+        ownDefense[ownTeam].games++;
+        ownDefense[ownTeam].sacks += isNaN(sacks) ? 0 : sacks;
+        ownDefense[ownTeam].ints += isNaN(ints) ? 0 : ints;
+      }
     });
 
     const teams = Object.keys(allowed);
@@ -823,6 +925,13 @@ async function fetchDefenseMatchups(){
     const leagueAvgPass = perGame.reduce((s, t) => s + t.passPerGame, 0) / perGame.length;
     const leagueAvgRush = perGame.reduce((s, t) => s + t.rushPerGame, 0) / perGame.length;
 
+    const ownTeams = Object.keys(ownDefense);
+    const turnoverPerGame = ownTeams.map(t => ({
+      team: t,
+      rate: (ownDefense[t].sacks + ownDefense[t].ints) / ownDefense[t].games
+    }));
+    const leagueAvgTurnoverRate = turnoverPerGame.reduce((s, t) => s + t.rate, 0) / (turnoverPerGame.length || 1);
+
     function clamp(f){ return Math.max(0.88, Math.min(1.12, f)); }
     const result = {};
     perGame.forEach(t => {
@@ -831,13 +940,110 @@ async function fetchDefenseMatchups(){
         rushFactor: clamp(t.rushPerGame / leagueAvgRush)
       };
     });
+    turnoverPerGame.forEach(t => {
+      if(!result[t.team]) result[t.team] = {};
+      result[t.team].turnoverFactor = leagueAvgTurnoverRate > 0 ? clamp(t.rate / leagueAvgTurnoverRate) : 1;
+    });
 
     defenseMatchupCache = result;
-    setEndpointStatus('defense', 'ok', 'Computed pass/rush defense splits for ' + teams.length + ' teams.');
+    setEndpointStatus('defense', 'ok', 'Computed pass/rush/turnover defense splits for ' + teams.length + ' teams.');
     return result;
   } catch(err){
     defenseMatchupCache = {};
     setEndpointStatus('defense', 'error', String(err.message || err));
+    return {};
+  }
+}
+
+// Practice-participation data from nflverse's injury reports — a sharper
+// signal than DraftKings' own Q/D/O tag alone, since a Questionable player
+// who was a full practice participant is a very different bet than one who
+// didn't practice all week.
+let injuryPracticeCache = null;
+async function fetchInjuryPracticeData(){
+  if(injuryPracticeCache) return injuryPracticeCache;
+  const proxy = getProxyUrl();
+  if(!proxy){ injuryPracticeCache = {}; setEndpointStatus('injuries', 'skipped', 'No Proxy URL set.'); return {}; }
+  if(typeof Papa === 'undefined'){ injuryPracticeCache = {}; setEndpointStatus('injuries', 'error', 'CSV parser failed to load.'); return {}; }
+  setEndpointStatus('injuries', 'pending', 'Fetching practice reports…');
+  try{
+    const season = new Date().getFullYear();
+    const res = await fetch(proxy + '/nflverse/injuries?season=' + season);
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const csvText = await res.text();
+    const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
+    const rows = parsed.data || [];
+    if(!rows.length) throw new Error('CSV came back empty.');
+
+    // Keep only each player's most recent week's report.
+    const latest = {};
+    rows.forEach(r => {
+      const name = r.full_name;
+      const week = Number(r.week);
+      if(!name || isNaN(week)) return;
+      const key = normalizePlayerName(name);
+      if(!latest[key] || week > latest[key].week){
+        latest[key] = { week, practiceStatus: (r.practice_status || '').toUpperCase() };
+      }
+    });
+
+    injuryPracticeCache = latest;
+    setEndpointStatus('injuries', 'ok', 'Loaded practice reports for ' + Object.keys(latest).length + ' players.');
+    return latest;
+  } catch(err){
+    injuryPracticeCache = {};
+    setEndpointStatus('injuries', 'error', String(err.message || err));
+    return {};
+  }
+}
+
+// Snap-share role trend from nflverse/PFR snap count data — a player whose
+// snap share is climbing recently can be a much better bet than a flat
+// season average would suggest (and vice versa for a shrinking role).
+let snapTrendCache = null;
+async function fetchSnapCountTrends(){
+  if(snapTrendCache) return snapTrendCache;
+  const proxy = getProxyUrl();
+  if(!proxy){ snapTrendCache = {}; setEndpointStatus('snaps', 'skipped', 'No Proxy URL set.'); return {}; }
+  if(typeof Papa === 'undefined'){ snapTrendCache = {}; setEndpointStatus('snaps', 'error', 'CSV parser failed to load.'); return {}; }
+  setEndpointStatus('snaps', 'pending', 'Fetching snap count trends…');
+  try{
+    const season = new Date().getFullYear();
+    const res = await fetch(proxy + '/nflverse/snap-counts?season=' + season);
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const csvText = await res.text();
+    const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
+    const rows = parsed.data || [];
+    if(!rows.length) throw new Error('CSV came back empty.');
+
+    const byPlayer = {};
+    rows.forEach(r => {
+      const name = r.player;
+      const week = Number(r.week);
+      let pct = Number(r.offense_pct);
+      if(!name || isNaN(week) || isNaN(pct)) return;
+      if(pct > 1) pct = pct / 100; // normalize in case this is 0-100 rather than 0-1
+      const key = normalizePlayerName(name);
+      if(!byPlayer[key]) byPlayer[key] = [];
+      byPlayer[key].push({ week, pct });
+    });
+
+    const result = {};
+    Object.keys(byPlayer).forEach(key => {
+      const games = byPlayer[key].sort((a, b) => a.week - b.week);
+      if(!games.length) return;
+      const latestPct = games[games.length - 1].pct;
+      const priorGames = games.slice(0, -1);
+      const priorAvg = priorGames.length ? priorGames.reduce((s, g) => s + g.pct, 0) / priorGames.length : latestPct;
+      result[key] = { latestPct, priorAvg, trend: latestPct - priorAvg };
+    });
+
+    snapTrendCache = result;
+    setEndpointStatus('snaps', 'ok', 'Loaded snap trends for ' + Object.keys(result).length + ' players.');
+    return result;
+  } catch(err){
+    snapTrendCache = {};
+    setEndpointStatus('snaps', 'error', String(err.message || err));
     return {};
   }
 }
@@ -1021,6 +1227,14 @@ function describeLineup(built){
     if(r.player.pos === 'RB') return d.rushFactor != null && d.rushFactor >= 1.08;
     return false;
   });
+  // Cheap + thin-data is the risky combination worth a manual gut-check —
+  // a cheap veteran with a full season of data isn't the same risk as a
+  // cheap player we barely have real numbers for.
+  const thinSampleValue = built.roster.filter(r =>
+    r.player.salary <= 3500 && r.player.dataConfidence === 'thin' && r.slot !== 'DST'
+  );
+  const risingRole = built.roster.filter(r => r.player.snapTrend != null && r.player.snapTrend >= 0.1);
+  const fadingRole = built.roster.filter(r => r.player.snapTrend != null && r.player.snapTrend <= -0.1);
 
   const parts = [];
   if(stacks.length) parts.push('Stacks ' + stacks.join(', ') + ' pass-game pieces together.');
@@ -1028,8 +1242,11 @@ function describeLineup(built){
   if(goodDstSpot.length) parts.push('DST faces a low implied opponent total.');
   if(easyMatchups.length) parts.push('Favorable matchups vs. weaker defenses: ' + easyMatchups.map(r => r.player.name).join(', ') + '.');
   if(toughMatchups.length) parts.push('Tougher matchups worth a second look: ' + toughMatchups.map(r => r.player.name).join(', ') + '.');
+  if(risingRole.length) parts.push('Snap share trending up recently: ' + risingRole.map(r => r.player.name).join(', ') + '.');
+  if(fadingRole.length) parts.push('Snap share trending down recently: ' + fadingRole.map(r => r.player.name).join(', ') + '.');
   if(flagged.length) parts.push('Includes injury-tagged players: ' + flagged.map(r => r.player.name + ' (' + r.player.injuryStatus + ')').join(', ') + '.');
   if(windy.length) parts.push('Wind ≥15mph expected for: ' + Array.from(new Set(windy.map(r => r.player.team))).join(', ') + '.');
+  if(thinSampleValue.length) parts.push('Cheap plays backed by limited data — worth a manual gut-check: ' + thinSampleValue.map(r => r.player.name).join(', ') + '.');
   if(!parts.length) parts.push('Highest-projected valid roster under the salary cap with no flagged risk factors.');
   return parts.join(' ');
 }
@@ -1431,12 +1648,28 @@ async function generateLineups(){
       const hist = await fetchHistoricalStats();
       pool.forEach(p => {
         const key = normalizePlayerName(p.name);
-        if(hist[key] != null) p.avgPts = hist[key]; // real recent form takes priority when we have it
+        if(hist[key] != null){
+          p.avgPts = hist[key].avg; // real recent form takes priority when we have it
+          p.dataConfidence = hist[key].confidence;
+        }
       });
 
       const defenseMatchups = await fetchDefenseMatchups();
       pool.forEach(p => {
         p.oppDefense = (p.opp && defenseMatchups[p.opp]) ? defenseMatchups[p.opp] : null;
+        p.ownDefense = defenseMatchups[p.team] || null; // used only for DST scoring
+      });
+
+      const injuries = await fetchInjuryPracticeData();
+      pool.forEach(p => {
+        const key = normalizePlayerName(p.name);
+        if(injuries[key]) p.practiceStatus = injuries[key].practiceStatus;
+      });
+
+      const snapTrends = await fetchSnapCountTrends();
+      pool.forEach(p => {
+        const key = normalizePlayerName(p.name);
+        if(snapTrends[key]) p.snapTrend = snapTrends[key].trend;
       });
     }
     computeProjections(pool);
