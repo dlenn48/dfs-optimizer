@@ -136,6 +136,18 @@
   .slateRow .srMeta{ color: var(--muted); font-size: 11px; }
   .slateRow .srGames{ color: var(--turf); font-size: 12px; white-space: nowrap; }
   .slateEmpty{ padding: 16px; color: var(--muted); font-size: 13px; text-align: center; }
+
+  .statusPanel{ display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
+  .statusChip{
+    display:flex; align-items:center; gap:6px; border:1px solid var(--line); background:var(--panel);
+    padding:5px 10px; border-radius:2px; font-size:11.5px; color:var(--muted); cursor:default;
+  }
+  .statusChip .dot{ width:8px; height:8px; border-radius:50%; background:var(--muted); flex-shrink:0; }
+  .statusChip.ok{ color: var(--chalk); }
+  .statusChip.ok .dot{ background: var(--turf); }
+  .statusChip.error{ color: var(--chalk); border-color: var(--rust); }
+  .statusChip.error .dot{ background: var(--rust); }
+  .statusChip.pending .dot{ background: var(--gold); }
 </style>
 </head>
 <body>
@@ -218,6 +230,7 @@
         <button class="btn" id="generateBtn">Generate lineups</button>
       </div>
 
+      <div id="statusPanel" class="statusPanel"></div>
       <div id="resultsArea">
         <div class="empty">Paste your player pool on the left and hit Generate. Claude will research current injuries, weather, and matchups before building lineups.</div>
       </div>
@@ -300,6 +313,35 @@ tabHistBtn.addEventListener('click', () => switchTab('hist'));
 function slugify(s){
   return (s || 'slate').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'slate';
 }
+
+// Tracks the health of every external call this tool makes, shown as a
+// small status strip so a failure in one source is obvious and isolated.
+const endpointStatus = {
+  dkContests: { label: 'DK Contests', state: 'idle', detail: 'Not loaded yet.' },
+  dkPool: { label: 'DK Player Pool', state: 'idle', detail: 'Pick a slate to fetch.' },
+  vegas: { label: 'Vegas Lines (ESPN)', state: 'idle', detail: 'Runs during Generate.' },
+  historical: { label: 'Historical Stats (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
+  weather: { label: 'Weather (Open-Meteo)', state: 'idle', detail: 'Runs during Generate.' }
+};
+
+function setEndpointStatus(key, state, detail){
+  if(!endpointStatus[key]) return;
+  endpointStatus[key].state = state; // idle | pending | ok | error | skipped
+  endpointStatus[key].detail = detail || '';
+  renderStatusPanel();
+}
+
+function renderStatusPanel(){
+  const el = document.getElementById('statusPanel');
+  if(!el) return;
+  el.innerHTML = Object.values(endpointStatus).map(s => {
+    const icon = s.state === 'ok' ? '✓' : s.state === 'error' ? '✗' : s.state === 'pending' ? '…' : '–';
+    const cls = (s.state === 'ok' || s.state === 'error' || s.state === 'pending') ? s.state : '';
+    const title = (s.detail || '').replace(/"/g, '&quot;');
+    return '<div class="statusChip ' + cls + '" title="' + title + '"><span class="dot"></span>' + s.label + ' ' + icon + '</div>';
+  }).join('');
+}
+renderStatusPanel();
 
 let contestsCache = [];
 let slatesCache = [];
@@ -461,15 +503,32 @@ async function enrichWithWeather(pool, dateKey){
     const key = p.homeTeam + '|' + hour;
     if(!groups.has(key)) groups.set(key, { team: p.homeTeam, hour });
   });
+
+  setEndpointStatus('weather', 'pending', 'Fetching weather…');
+  const outdoorGroups = Array.from(groups.values()).filter(g => STADIUMS[g.team] && !STADIUMS[g.team].dome);
   const weatherByKey = {};
+  let successCount = 0, failCount = 0;
   await Promise.all(Array.from(groups.entries()).map(async ([key, g]) => {
-    weatherByKey[key] = await fetchWeatherForTeam(g.team, dateKey, g.hour);
+    const result = await fetchWeatherForTeam(g.team, dateKey, g.hour);
+    weatherByKey[key] = result;
+    const isOutdoor = STADIUMS[g.team] && !STADIUMS[g.team].dome;
+    if(isOutdoor){ result ? successCount++ : failCount++; }
   }));
   pool.forEach(p => {
     if(!p.homeTeam){ p.weather = null; return; }
     const hour = p.kickoffHour != null ? p.kickoffHour : 13;
     p.weather = weatherByKey[p.homeTeam + '|' + hour];
   });
+
+  if(!outdoorGroups.length){
+    setEndpointStatus('weather', 'ok', 'No outdoor games on this slate — nothing to check.');
+  } else if(failCount === 0){
+    setEndpointStatus('weather', 'ok', 'Got forecasts for ' + successCount + ' outdoor game(s).');
+  } else if(successCount > 0){
+    setEndpointStatus('weather', 'error', successCount + ' outdoor forecast(s) succeeded, ' + failCount + ' failed.');
+  } else {
+    setEndpointStatus('weather', 'error', 'All ' + failCount + ' outdoor forecast request(s) failed.');
+  }
 }
 
 // Statuses that mean a player has ~zero chance of playing. Covers a few more
@@ -521,7 +580,8 @@ const vegasCache = {};
 async function fetchVegasLines(dateKey){
   if(vegasCache[dateKey] !== undefined) return vegasCache[dateKey];
   const proxy = getProxyUrl();
-  if(!proxy){ vegasCache[dateKey] = {}; return {}; }
+  if(!proxy){ vegasCache[dateKey] = {}; setEndpointStatus('vegas', 'skipped', 'No Proxy URL set.'); return {}; }
+  setEndpointStatus('vegas', 'pending', 'Fetching Vegas lines…');
   try{
     const ymd = dateKey.replace(/-/g, '');
     const res = await fetch(proxy + '/espn/scoreboard?dates=' + ymd);
@@ -547,9 +607,16 @@ async function fetchVegasLines(dateKey){
       });
     });
     vegasCache[dateKey] = totals;
+    const teamCount = Object.keys(totals).length;
+    if(teamCount){
+      setEndpointStatus('vegas', 'ok', 'Got implied totals for ' + teamCount + ' teams.');
+    } else {
+      setEndpointStatus('vegas', 'error', 'Response came back with no usable odds data.');
+    }
     return totals;
   } catch(err){
     vegasCache[dateKey] = {};
+    setEndpointStatus('vegas', 'error', String(err.message || err));
     return {};
   }
 }
@@ -569,7 +636,9 @@ let historicalStatsCache = null;
 async function fetchHistoricalStats(){
   if(historicalStatsCache) return historicalStatsCache;
   const proxy = getProxyUrl();
-  if(!proxy || typeof Papa === 'undefined'){ historicalStatsCache = {}; return {}; }
+  if(!proxy){ historicalStatsCache = {}; setEndpointStatus('historical', 'skipped', 'No Proxy URL set.'); return {}; }
+  if(typeof Papa === 'undefined'){ historicalStatsCache = {}; setEndpointStatus('historical', 'error', 'CSV parser (PapaParse) failed to load.'); return {}; }
+  setEndpointStatus('historical', 'pending', 'Fetching historical stats…');
   try{
     const season = new Date().getFullYear();
     const res = await fetch(proxy + '/nflverse/player-stats?season=' + season);
@@ -577,6 +646,7 @@ async function fetchHistoricalStats(){
     const csvText = await res.text();
     const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
     const rows = parsed.data || [];
+    if(!rows.length) throw new Error('CSV came back empty.');
 
     const byPlayer = {};
     rows.forEach(r => {
@@ -597,9 +667,11 @@ async function fetchHistoricalStats(){
       result[key] = Math.round(avg * 10) / 10;
     });
     historicalStatsCache = result;
+    setEndpointStatus('historical', 'ok', 'Loaded recent-form data for ' + Object.keys(result).length + ' players.');
     return result;
   } catch(err){
     historicalStatsCache = {};
+    setEndpointStatus('historical', 'error', String(err.message || err));
     return {};
   }
 }
@@ -945,6 +1017,7 @@ async function loadSlatesAndContests(){
   const refreshBtn = document.getElementById('refreshSlatesBtn');
   refreshBtn.disabled = true;
   document.getElementById('slateLoadStatus').textContent = '(loading…)';
+  setEndpointStatus('dkContests', 'pending', 'Fetching contest list…');
   try{
     const proxy = getProxyUrl();
     const url = proxy
@@ -968,6 +1041,7 @@ async function loadSlatesAndContests(){
 
     slatesCache = deriveSlates(data, contestsCache);
     if(!slatesCache.length) throw new Error('Could not identify any slates from the response.');
+    setEndpointStatus('dkContests', 'ok', 'Loaded ' + slatesCache.length + ' slates, ' + contestsCache.length + ' contests.');
 
     const dates = Array.from(new Set(slatesCache.map(s => s.dateKey))).sort();
     selectedDate = dates[0];
@@ -984,6 +1058,7 @@ async function loadSlatesAndContests(){
       .sort((a,b) => (b.gameCount||0) - (a.gameCount||0))[0];
     if(firstOfDay) await onSlateChange(firstOfDay.draftGroupId);
   } catch(err){
+    setEndpointStatus('dkContests', 'error', String(err.message || err));
     document.getElementById('slateLoadStatus').textContent = '';
     setFetchStatus('Could not auto-load slates: ' + (err.message || err) + ' This is an unofficial DraftKings endpoint — your browser may be blocking the cross-origin request (CORS), or the format changed. Use "Enter draft group ID manually" below instead.', true);
   } finally {
@@ -994,6 +1069,7 @@ async function loadSlatesAndContests(){
 async function fetchPoolForDraftGroup(candidateIds){
   const ids = Array.isArray(candidateIds) ? candidateIds.filter(Boolean) : [candidateIds].filter(Boolean);
   if(!ids.length) return;
+  setEndpointStatus('dkPool', 'pending', 'Fetching player pool…');
 
   let lastErr = null;
   for(let i = 0; i < ids.length; i++){
@@ -1023,6 +1099,7 @@ async function fetchPoolForDraftGroup(candidateIds){
           (i > 0 ? ' (the first option for this slate wasn\'t a standard Classic pool, so this used alternate draft group ' + id + ')' : '') +
           '. Ready to generate.'
         );
+        setEndpointStatus('dkPool', 'ok', 'Pulled ' + currentPool.length + ' players from draft group ' + id + '.');
         return;
       }
       // Not a standard salary-cap Classic pool (e.g. Pick6/Best Ball) — try the next candidate, if any.
@@ -1037,6 +1114,7 @@ async function fetchPoolForDraftGroup(candidateIds){
   }
 
   currentPool = [];
+  setEndpointStatus('dkPool', 'error', String(lastErr && (lastErr.message || lastErr) || 'No valid draft group found.'));
   setFetchStatus(
     'Tried ' + ids.length + ' draft group option' + (ids.length > 1 ? 's' : '') + ' for this slate and none had standard salary-cap + DST data' +
     (lastErr ? ' (last issue: ' + (lastErr.message || lastErr) + ')' : '') +
