@@ -537,6 +537,44 @@ async function enrichWithWeather(pool, dateKey){
 // DraftKings/real-world variants than just Q/D/O.
 const ZERO_OUT_STATUSES = new Set(['O','OUT','IR','IR-R','PUP','NA','SUSP','DNP','RESERVE']);
 
+// Continuous (rather than on/off) weather scaling. A step function at
+// exactly 15mph meant 14mph and 30mph looked identical, and 16mph got
+// treated the same as a genuine gale. These ramp smoothly instead.
+function windPassFactor(wind){
+  if(wind == null) return 1;
+  const impact = Math.max(0, Math.min((wind - 8) / 100, 0.15)); // starts ~8mph, caps at 15% by ~23mph
+  return 1 - impact;
+}
+function windRushFactor(wind){
+  if(wind == null) return 1;
+  const boost = Math.max(0, Math.min((wind - 8) / 150, 0.05)); // smaller, slower-building positive effect
+  return 1 + boost;
+}
+function precipPassFactor(precip){
+  if(precip == null) return 1;
+  const impact = Math.max(0, Math.min((precip - 30) / 70, 1)) * 0.08; // starts mattering past ~30% chance
+  return 1 - impact;
+}
+
+// Game-script factor from the spread's magnitude (not just the blended
+// total): big favorites tend to lean on the run and control clock; big
+// underdogs tend to throw more, especially trailing late. Close games (under
+// a ~3-point margin) get no adjustment at all.
+function gameScriptFactor(pos, spread){
+  if(spread == null) return 1;
+  const magnitude = Math.min(Math.abs(spread), 14);
+  if(magnitude < 3) return 1;
+  const scale = (magnitude - 3) / 11; // 0 at a 3-point game, 1 at a 14+ point blowout
+  if(spread <= -3){ // this team is favored
+    if(pos === 'RB') return 1 + scale * 0.08;
+    if(pos === 'QB' || pos === 'WR' || pos === 'TE') return 1 - scale * 0.05;
+  } else if(spread >= 3){ // this team is the underdog
+    if(pos === 'QB' || pos === 'WR' || pos === 'TE') return 1 + scale * 0.08;
+    if(pos === 'RB') return 1 - scale * 0.05;
+  }
+  return 1;
+}
+
 function computeProjections(pool){
   pool.forEach(p => {
     let proj = baselineProjection(p);
@@ -549,23 +587,27 @@ function computeProjections(pool){
     // Coded weather adjustment for outdoor stadiums, at the actual kickoff hour.
     const w = p.weather;
     if(w){
-      if(w.wind != null && w.wind >= 15 && ['QB','WR','TE'].includes(p.pos)) proj *= 0.9;
-      if(w.wind != null && w.wind >= 15 && p.pos === 'RB') proj *= 1.05;
-      if(w.precip != null && w.precip >= 50 && ['QB','WR','TE'].includes(p.pos)) proj *= 0.95;
+      if(['QB','WR','TE'].includes(p.pos)) proj *= windPassFactor(w.wind) * precipPassFactor(w.precip);
+      if(p.pos === 'RB') proj *= windRushFactor(w.wind);
     }
 
-    // Coded Vegas adjustment: scale toward a team's implied total relative to
-    // a league-average implied total (~22.5, i.e. a ~45-point game split evenly).
-    // DST scales the opposite way — a low-scoring opponent is good for defense.
-    // Clamp kept fairly tight: a team total is a blunt, team-wide signal
-    // (it doesn't know which positions actually benefit against a given
-    // defense), so it should nudge projections, not dominate them.
+    // Coded Vegas total adjustment: scale toward a team's implied total
+    // relative to league average (~22.5). DST scales the opposite way — a
+    // low-scoring opponent is good for defense. Clamp kept fairly tight: a
+    // team total is a blunt, team-wide signal (it doesn't know which
+    // positions actually benefit against a given defense), so it should
+    // nudge projections, not dominate them.
     const LEAGUE_AVG_TEAM_TOTAL = 22.5;
     function clampFactor(f){ return Math.max(0.9, Math.min(1.15, f)); }
     if(p.pos !== 'DST' && p.impliedTotal != null){
       proj *= clampFactor(p.impliedTotal / LEAGUE_AVG_TEAM_TOTAL);
     } else if(p.pos === 'DST' && p.oppImpliedTotal != null){
       proj *= clampFactor(LEAGUE_AVG_TEAM_TOTAL / Math.max(p.oppImpliedTotal, 1));
+    }
+
+    // Coded game-script adjustment from spread magnitude.
+    if(p.pos !== 'DST'){
+      proj *= gameScriptFactor(p.pos, p.spread);
     }
 
     p.proj = Math.round(proj * 10) / 10;
@@ -591,7 +633,7 @@ const vegasCache = {};
 async function fetchVegasLines(dateKey){
   if(vegasCache[dateKey] !== undefined) return vegasCache[dateKey];
   const proxy = getProxyUrl();
-  if(!proxy){ vegasCache[dateKey] = {}; setEndpointStatus('vegas', 'skipped', 'No Proxy URL set.'); return {}; }
+  if(!proxy){ vegasCache[dateKey] = { totals: {}, spreads: {} }; setEndpointStatus('vegas', 'skipped', 'No Proxy URL set.'); return vegasCache[dateKey]; }
   setEndpointStatus('vegas', 'pending', 'Fetching Vegas lines…');
   try{
     const res = await fetch(proxy + '/oddsapi/nfl');
@@ -600,6 +642,7 @@ async function fetchVegasLines(dateKey){
     if(!Array.isArray(games)) throw new Error(games && games.error ? games.error : 'Unexpected response shape.');
 
     const totals = {};
+    const spreads = {};
     games.forEach(g => {
       const home = TEAM_NAME_TO_ABBR[g.home_team];
       const away = TEAM_NAME_TO_ABBR[g.away_team];
@@ -618,20 +661,24 @@ async function fetchVegasLines(dateKey){
       }
       totals[home] = Math.round((overUnder / 2 - homeSpread / 2) * 10) / 10;
       totals[away] = Math.round((overUnder / 2 + homeSpread / 2) * 10) / 10;
+      // Store spread as "points this team is an underdog by" (positive =
+      // underdog, negative = favorite), independent of home/away.
+      spreads[home] = Math.round(homeSpread * 10) / 10;
+      spreads[away] = Math.round(-homeSpread * 10) / 10;
     });
 
-    vegasCache[dateKey] = totals;
+    vegasCache[dateKey] = { totals, spreads };
     const teamCount = Object.keys(totals).length;
     if(teamCount){
-      setEndpointStatus('vegas', 'ok', 'Got implied totals for ' + teamCount + ' teams.');
+      setEndpointStatus('vegas', 'ok', 'Got implied totals/spreads for ' + teamCount + ' teams.');
     } else {
       setEndpointStatus('vegas', 'error', 'Response came back with no usable odds data.');
     }
-    return totals;
+    return vegasCache[dateKey];
   } catch(err){
-    vegasCache[dateKey] = {};
+    vegasCache[dateKey] = { totals: {}, spreads: {} };
     setEndpointStatus('vegas', 'error', String(err.message || err));
-    return {};
+    return vegasCache[dateKey];
   }
 }
 
@@ -646,6 +693,31 @@ function normalizePlayerName(name){
     .trim();
 }
 
+// Fetches one season's file and returns { key -> { avg, games } }, or null
+// on failure (distinct from {} = fetched fine but nothing usable).
+async function fetchSeasonStatsRaw(proxy, season){
+  try{
+    const res = await fetch(proxy + '/nflverse/player-stats?season=' + season);
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const csvText = await res.text();
+    const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
+    const rows = parsed.data || [];
+    if(!rows.length) throw new Error('CSV came back empty.');
+
+    const result = {};
+    rows.forEach(r => {
+      const name = r.player_display_name || r.player_name;
+      const games = Number(r.games);
+      const pts = r.fantasy_points_ppr != null ? Number(r.fantasy_points_ppr) : Number(r.fantasy_points);
+      if(!name || !games || isNaN(games) || isNaN(pts)) return;
+      result[normalizePlayerName(name)] = { avg: pts / games, games };
+    });
+    return result;
+  } catch(err){
+    return null;
+  }
+}
+
 let historicalStatsCache = null;
 async function fetchHistoricalStats(){
   if(historicalStatsCache) return historicalStatsCache;
@@ -655,28 +727,39 @@ async function fetchHistoricalStats(){
   setEndpointStatus('historical', 'pending', 'Fetching historical stats…');
   try{
     const season = new Date().getFullYear();
-    const res = await fetch(proxy + '/nflverse/player-stats?season=' + season);
-    if(!res.ok) throw new Error('nflverse HTTP ' + res.status);
-    const csvText = await res.text();
-    const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
-    const rows = parsed.data || [];
-    if(!rows.length) throw new Error('CSV came back empty.');
+    // This file holds season-to-date TOTALS, so early in a season a player's
+    // average can be based on just 1-2 games — one huge or one awful game
+    // skews it hard. Blend in last season's full-year average as a
+    // stabilizing prior, weighted down as more current-season games pile up
+    // (full weight to current-season data by ~4 games played).
+    const [current, previous] = await Promise.all([
+      fetchSeasonStatsRaw(proxy, season),
+      fetchSeasonStatsRaw(proxy, season - 1)
+    ]);
+    if(current === null && previous === null) throw new Error('Both current- and prior-season fetches failed.');
 
-    // This file holds season-to-date TOTALS (no per-week rows), so the best
-    // real-data signal available here is points-per-game so far this season
-    // — not a recent-form trend, but genuine accumulated performance rather
-    // than a salary-derived guess.
+    const curMap = current || {};
+    const prevMap = previous || {};
+    const keys = new Set([...Object.keys(curMap), ...Object.keys(prevMap)]);
     const result = {};
-    rows.forEach(r => {
-      const name = r.player_display_name || r.player_name;
-      const games = Number(r.games);
-      const pts = r.fantasy_points_ppr != null ? Number(r.fantasy_points_ppr) : Number(r.fantasy_points);
-      if(!name || !games || isNaN(games) || isNaN(pts)) return;
-      const key = normalizePlayerName(name);
-      result[key] = Math.round((pts / games) * 10) / 10;
+    keys.forEach(key => {
+      const cur = curMap[key];
+      const prev = prevMap[key];
+      if(cur && prev){
+        const w = Math.min(cur.games / 4, 1);
+        result[key] = Math.round((cur.avg * w + prev.avg * (1 - w)) * 10) / 10;
+      } else if(cur){
+        result[key] = Math.round(cur.avg * 10) / 10;
+      } else if(prev){
+        result[key] = Math.round(prev.avg * 10) / 10;
+      }
     });
+
     historicalStatsCache = result;
-    setEndpointStatus('historical', 'ok', 'Loaded season-average data for ' + Object.keys(result).length + ' players.');
+    const note = current
+      ? (Object.keys(curMap).length + ' players with current-season data' + (previous ? ', blended with prior season for thin samples' : ''))
+      : 'current-season fetch failed, using prior season only';
+    setEndpointStatus('historical', 'ok', 'Loaded ' + Object.keys(result).length + ' players (' + note + ').');
     return result;
   } catch(err){
     historicalStatsCache = {};
@@ -1250,8 +1333,9 @@ async function generateLineups(){
 
       const vegas = await fetchVegasLines(dateKey);
       pool.forEach(p => {
-        p.impliedTotal = vegas[p.team] != null ? vegas[p.team] : null;
-        p.oppImpliedTotal = (p.opp && vegas[p.opp] != null) ? vegas[p.opp] : null;
+        p.impliedTotal = vegas.totals[p.team] != null ? vegas.totals[p.team] : null;
+        p.oppImpliedTotal = (p.opp && vegas.totals[p.opp] != null) ? vegas.totals[p.opp] : null;
+        p.spread = vegas.spreads[p.team] != null ? vegas.spreads[p.team] : null;
       });
 
       const hist = await fetchHistoricalStats();
