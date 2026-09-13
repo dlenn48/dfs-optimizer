@@ -557,8 +557,11 @@ function computeProjections(pool){
     // Coded Vegas adjustment: scale toward a team's implied total relative to
     // a league-average implied total (~22.5, i.e. a ~45-point game split evenly).
     // DST scales the opposite way — a low-scoring opponent is good for defense.
+    // Clamp kept fairly tight: a team total is a blunt, team-wide signal
+    // (it doesn't know which positions actually benefit against a given
+    // defense), so it should nudge projections, not dominate them.
     const LEAGUE_AVG_TEAM_TOTAL = 22.5;
-    function clampFactor(f){ return Math.max(0.8, Math.min(1.25, f)); }
+    function clampFactor(f){ return Math.max(0.9, Math.min(1.15, f)); }
     if(p.pos !== 'DST' && p.impliedTotal != null){
       proj *= clampFactor(p.impliedTotal / LEAGUE_AVG_TEAM_TOTAL);
     } else if(p.pos === 'DST' && p.oppImpliedTotal != null){
@@ -695,24 +698,19 @@ function buildLineup(pool, cap, excludeIds){
   const roster = [];
   let remainingCap = cap;
 
-  // Distribution rule, matching how real DFS builds actually look: one team
-  // is allowed up to a 3-man stack (the normal "QB + 2 pass-catchers" or
-  // similar), but every OTHER team is capped at 2. Without the second half
-  // of this rule, a per-team-only cap still lets two or more teams each hit
-  // the max simultaneously — which is what was still happening.
-  const STACK_CAP = 3;
-  const SECONDARY_CAP = 2;
+  // Flat team cap, no deliberate "allow one real stack" carve-out — team
+  // grouping isn't something the optimizer should be engineering toward.
+  // If two players from the same team both happen to be the best individual
+  // value, they'll land together naturally; this just prevents runaway
+  // concentration, it doesn't reward correlation on purpose.
+  const TEAM_CAP = 2;
   function isValidDistribution(players){
     const counts = {};
-    let stacksAtMax = 0;
     for(const p of players){
       counts[p.team] = (counts[p.team] || 0) + 1;
+      if(counts[p.team] > TEAM_CAP) return false;
     }
-    for(const team in counts){
-      if(counts[team] > STACK_CAP) return false;
-      if(counts[team] > SECONDARY_CAP) stacksAtMax++;
-    }
-    return stacksAtMax <= 1;
+    return true;
   }
 
   function cheapestFor(slot){
