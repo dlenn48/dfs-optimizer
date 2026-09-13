@@ -695,6 +695,15 @@ function buildLineup(pool, cap, excludeIds){
   const roster = [];
   let remainingCap = cap;
 
+  // Caps how many players from one team can land in a single lineup. Without
+  // this, Vegas-boosted teams can make pure point-maximization pile 4-5
+  // players onto one team — technically "optimal" by the math, but a much
+  // more concentrated bet than a normal DFS build.
+  const MAX_PER_TEAM = 3;
+  function teamCount(team, excludeIds2){
+    return roster.filter(r => r.player.team === team && !(excludeIds2 || []).includes(r.player.id)).length;
+  }
+
   function cheapestFor(slot){
     const c = available.filter(p => !used.has(p.id) && eligibleForSlot(p, slot));
     return c.length ? Math.min(...c.map(p => p.salary)) : 0;
@@ -707,9 +716,16 @@ function buildLineup(pool, cap, excludeIds){
     const budget = remainingCap - reserve;
 
     let candidates = available
-      .filter(p => !used.has(p.id) && eligibleForSlot(p, slot) && p.salary <= budget)
+      .filter(p => !used.has(p.id) && eligibleForSlot(p, slot) && p.salary <= budget && teamCount(p.team) < MAX_PER_TEAM)
       .sort((a, b) => b.proj - a.proj);
 
+    if(!candidates.length){
+      // Relax the team cap before relaxing budget — a slightly concentrated
+      // lineup is preferable to an infeasible one, but budget still matters more.
+      candidates = available
+        .filter(p => !used.has(p.id) && eligibleForSlot(p, slot) && p.salary <= budget)
+        .sort((a, b) => b.proj - a.proj);
+    }
     if(!candidates.length){
       candidates = available
         .filter(p => !used.has(p.id) && eligibleForSlot(p, slot))
@@ -732,7 +748,10 @@ function buildLineup(pool, cap, excludeIds){
     for(const entry of roster){
       const budget = remainingCap + entry.player.salary;
       const alt = available
-        .filter(p => !used.has(p.id) && eligibleForSlot(p, entry.slot) && p.salary <= budget && p.proj > entry.player.proj)
+        .filter(p =>
+          !used.has(p.id) && eligibleForSlot(p, entry.slot) && p.salary <= budget && p.proj > entry.player.proj &&
+          teamCount(p.team, [entry.player.id]) < MAX_PER_TEAM
+        )
         .sort((a, b) => b.proj - a.proj)[0];
       if(alt){
         used.delete(entry.player.id);
@@ -767,6 +786,7 @@ function buildLineup(pool, cap, excludeIds){
         const a = roster[i], b = roster[j];
         const freedBudget = remainingCap + a.player.salary + b.player.salary;
         const currentCombined = a.player.proj + b.player.proj;
+        const excludeForCount = [a.player.id, b.player.id];
         let best = null;
 
         for(const pa of topCandidatesFor(a.slot)){
@@ -776,6 +796,11 @@ function buildLineup(pool, cap, excludeIds){
             if(used.has(pb.id) && pb.id !== a.player.id && pb.id !== b.player.id) continue;
             const combinedSalary = pa.salary + pb.salary;
             if(combinedSalary > freedBudget) continue;
+            // Check the team cap as it would look AFTER this swap, including
+            // the case where pa and pb are teammates of each other.
+            const paTeamAfter = teamCount(pa.team, excludeForCount) + 1 + (pb.team === pa.team ? 1 : 0);
+            const pbTeamAfter = teamCount(pb.team, excludeForCount) + 1 + (pa.team === pb.team ? 1 : 0);
+            if(paTeamAfter > MAX_PER_TEAM || pbTeamAfter > MAX_PER_TEAM) continue;
             const combinedProj = pa.proj + pb.proj;
             if(combinedProj > currentCombined + 0.01 && (!best || combinedProj > best.combinedProj)){
               best = { pa, pb, combinedProj };
@@ -810,7 +835,8 @@ function describeLineup(built){
     }
   });
   const stacks = Object.entries(stackMap).filter(([, n]) => n >= 2).map(([team]) => team);
-  const flagged = built.roster.filter(r => r.player.injuryStatus && r.player.injuryStatus !== '');
+  const HEALTHY_STATUSES = new Set(['', 'NONE', 'N/A', 'ACTIVE', 'HEALTHY']);
+  const flagged = built.roster.filter(r => !HEALTHY_STATUSES.has((r.player.injuryStatus || '').toUpperCase()));
   const windy = built.roster.filter(r => r.player.weather && r.player.weather.wind != null && r.player.weather.wind >= 15);
   const highTotal = built.roster.filter(r => r.player.impliedTotal != null && r.player.impliedTotal >= 25 && r.slot !== 'DST');
   const goodDstSpot = built.roster.filter(r => r.slot === 'DST' && r.player.oppImpliedTotal != null && r.player.oppImpliedTotal <= 19);
