@@ -114,6 +114,27 @@
   .histItem .hTitle{ font-size: 16px; }
   .histItem .hMeta{ color: var(--muted); font-size: 12px; margin-top: 3px; }
   .histDetail{ margin-top: 16px; }
+
+  .chipRow{ display:flex; flex-wrap:wrap; gap:6px; }
+  .chip{
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+    padding: 5px 11px; font-size: 12px; border-radius: 2px; cursor: pointer;
+  }
+  .chip.active{ color: var(--chalk); border-color: var(--gold); background: rgba(217,169,78,0.1); }
+
+  .slateTable{ margin-top: 8px; max-height: 260px; overflow-y: auto; border: 1px solid var(--line); border-radius: 2px; }
+  .slateRow{
+    display:flex; justify-content:space-between; align-items:center; gap: 10px;
+    padding: 9px 12px; border-bottom: 1px solid rgba(43,70,54,0.5); cursor: pointer; font-size: 13px;
+  }
+  .slateRow:last-child{ border-bottom: none; }
+  .slateRow:hover{ background: rgba(217,169,78,0.06); }
+  .slateRow.active{ background: rgba(217,169,78,0.14); border-left: 2px solid var(--gold); }
+  .slateRow .srMain{ display:flex; flex-direction:column; gap: 2px; }
+  .slateRow .srLabel{ color: var(--chalk); }
+  .slateRow .srMeta{ color: var(--muted); font-size: 11px; }
+  .slateRow .srGames{ color: var(--turf); font-size: 12px; white-space: nowrap; }
+  .slateEmpty{ padding: 16px; color: var(--muted); font-size: 13px; text-align: center; }
 </style>
 </head>
 <body>
@@ -144,8 +165,33 @@
         </div>
         <div class="field">
           <label for="weekLabel">Slate label</label>
-          <input type="text" id="weekLabel" placeholder="e.g. Week 1 2026 — Sun Main">
+          <input type="text" id="weekLabel" placeholder="Pick a slate below to fill this in">
         </div>
+
+        <div class="field">
+          <label>Slate <span id="slateLoadStatus" style="color:var(--muted); font-weight:400;"></span></label>
+          <div id="dateTabs" class="chipRow"></div>
+          <div id="typeTabs" class="chipRow" style="margin-top:6px;"></div>
+          <div id="slateTable" class="slateTable"></div>
+        </div>
+
+        <div style="margin-bottom:14px;">
+          <button type="button" id="refreshSlatesBtn" class="btn ghost" style="font-size:11px;">Refresh slate list</button>
+          <button type="button" id="manualToggle" class="btn ghost" style="font-size:11px;">Enter draft group ID manually</button>
+        </div>
+        <div id="manualIdRow" style="display:none; margin-bottom:14px;">
+          <input type="text" id="manualDraftGroupId" placeholder="Draft group ID, e.g. 107213">
+          <button type="button" class="btn ghost" id="manualFetchBtn" style="font-size:11px; margin-top:8px;">Fetch this draft group</button>
+        </div>
+        <div id="fetchStatus" style="font-size:12px; color:var(--muted); margin-bottom:14px;"></div>
+
+        <div class="field">
+          <label for="contestSelect">Contest <span style="color:var(--muted); font-weight:400;">(optional — fills in context below)</span></label>
+          <select id="contestSelect">
+            <option value="">Pick a slate first</option>
+          </select>
+        </div>
+
         <div class="row2">
           <div class="field">
             <label for="contestType">Contest type</label>
@@ -157,7 +203,8 @@
           </div>
           <div class="field">
             <label for="salaryCap">Salary cap</label>
-            <input type="number" id="salaryCap" value="50000">
+            <input type="number" id="salaryCap" value="50000" readonly style="opacity:0.7; cursor:not-allowed;">
+            <div style="font-size:11px; color:var(--muted); margin-top:4px;">Set automatically from the slate — DraftKings NFL is always $50,000.</div>
           </div>
         </div>
         <div class="field">
@@ -168,27 +215,6 @@
             <option value="5">5</option>
           </select>
         </div>
-        <div class="field">
-          <label for="slateSelect">Slate <span id="slateLoadStatus" style="color:var(--muted); font-weight:400;"></span></label>
-          <select id="slateSelect">
-            <option value="">Loading NFL slates…</option>
-          </select>
-        </div>
-        <div class="field">
-          <label for="contestSelect">Contest <span style="color:var(--muted); font-weight:400;">(optional — fills in context below)</span></label>
-          <select id="contestSelect">
-            <option value="">Pick a slate first</option>
-          </select>
-        </div>
-        <div style="margin-bottom:14px;">
-          <button type="button" id="refreshSlatesBtn" class="btn ghost" style="font-size:11px;">Refresh slate list</button>
-          <button type="button" id="manualToggle" class="btn ghost" style="font-size:11px;">Enter draft group ID manually</button>
-        </div>
-        <div id="manualIdRow" style="display:none; margin-bottom:14px;">
-          <input type="text" id="manualDraftGroupId" placeholder="Draft group ID, e.g. 107213">
-          <button type="button" class="btn ghost" id="manualFetchBtn" style="font-size:11px; margin-top:8px;">Fetch this draft group</button>
-        </div>
-        <div id="fetchStatus" style="font-size:12px; color:var(--muted); margin-bottom:14px;"></div>
         <div class="field pool">
           <label for="playerPool">Player pool <span style="color:var(--muted); font-weight:400;">(fills automatically once you pick a slate)</span></label>
           <textarea id="playerPool" placeholder="Pick a slate above and this fills automatically. You can still paste/edit manually if needed."></textarea>
@@ -344,64 +370,137 @@ function formatDate(raw){
   } catch(e){ return null; }
 }
 
-function slateLabel(s){
-  const parts = [];
-  parts.push(formatDate(s.startTime) || 'date unknown');
-  if(s.gameCount) parts.push(s.gameCount + ' games');
-  if(s.tag) parts.push(s.tag);
-  return parts.join(' — ') + ' (Slate ' + s.draftGroupId + ')';
+let selectedDate = null;
+let selectedType = 'all';
+let activeDraftGroupId = null;
+
+function extractMatchup(game){
+  if(!game) return null;
+  const away = game.awayTeamAbbreviation ?? game.AwayTeamAbbreviation ?? game.away ?? game.AwayTeam ?? game.awayTeamName ?? game.AwayTeamName ?? null;
+  const home = game.homeTeamAbbreviation ?? game.HomeTeamAbbreviation ?? game.home ?? game.HomeTeam ?? game.homeTeamName ?? game.HomeTeamName ?? null;
+  return (away && home) ? (away + ' @ ' + home) : null;
+}
+
+function dateKeyOf(raw){
+  if(!raw) return 'unknown';
+  const d = new Date(raw);
+  if(isNaN(d.getTime())) return 'unknown';
+  return d.toISOString().slice(0, 10);
+}
+
+function dateTabLabel(key){
+  if(key === 'unknown') return 'Unknown date';
+  const d = new Date(key + 'T00:00:00');
+  if(isNaN(d.getTime())) return key;
+  return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+function slateRowLabel(s){
+  if(s.matchup) return s.matchup;
+  if(s.tag) return s.tag;
+  return s.kind === 'classic' ? 'Classic Main' : (s.kind === 'showdown' ? 'Showdown' : 'Slate ' + s.draftGroupId);
 }
 
 // Derive slates (draft groups) either from a dedicated DraftGroups block if
 // DraftKings' response includes one, or by deduping the flat contest list —
 // field names here are best-guesses since this endpoint is undocumented.
-// "kind" buckets full multi-game slates vs single-game (Showdown) slates so
-// they can be shown as separate groups in the dropdown.
+// "kind" maps to DraftKings' own Classic (multi-game) vs Showdown (single-game)
+// naming so the picker matches what you're used to seeing on their site.
 function deriveSlates(data, contests){
   const rawGroups = data.DraftGroups || data.draftGroups || [];
+  let slates;
   if(rawGroups.length){
-    return rawGroups.map(g => {
-      const gameCount = (g.Games && g.Games.length) || g.GameCount || g.gameCount || null;
+    slates = rawGroups.map(g => {
+      const games = g.Games || g.games || [];
+      const gameCount = games.length || g.GameCount || g.gameCount || null;
       return {
         draftGroupId: g.DraftGroupId ?? g.draftGroupId ?? g.Id,
         startTime: g.StartDateEst ?? g.startDate ?? g.StartDate ?? g.ContestStartTime ?? g.startTime ?? null,
         gameCount: gameCount,
         tag: g.DraftGroupTag || g.ContestStartTimeSuffix || g.Description || '',
-        kind: gameCount === 1 ? 'single' : (gameCount > 1 ? 'multi' : 'unknown')
+        matchup: gameCount === 1 ? extractMatchup(games[0]) : null,
+        kind: gameCount === 1 ? 'showdown' : (gameCount > 1 ? 'classic' : 'unknown')
       };
     }).filter(s => s.draftGroupId != null);
+  } else {
+    // Fallback: dedupe from contests. Game count/type usually isn't available
+    // per contest in this shape, so these land in an "unknown" bucket.
+    const seen = new Map();
+    contests.forEach(c => {
+      if(c.dg == null || seen.has(c.dg)) return;
+      seen.set(c.dg, { draftGroupId: c.dg, startTime: c.startTime || null, gameCount: null, tag: '', matchup: null, kind: 'unknown' });
+    });
+    slates = Array.from(seen.values());
   }
-  // Fallback: dedupe from contests. Game count usually isn't available per
-  // contest in this shape, so these land in an "Other" bucket for now.
-  const seen = new Map();
-  contests.forEach(c => {
-    if(c.dg == null || seen.has(c.dg)) return;
-    seen.set(c.dg, { draftGroupId: c.dg, startTime: c.startTime || null, gameCount: null, tag: '', kind: 'unknown' });
-  });
-  return Array.from(seen.values());
+  slates.forEach(s => { s.dateKey = dateKeyOf(s.startTime); });
+  return slates;
 }
 
-function renderSlateOptions(){
-  const select = document.getElementById('slateSelect');
-  select.innerHTML = '';
-  const groups = [
-    { key: 'multi', label: 'Full Slates' },
-    { key: 'single', label: 'Single-Game (Showdown)' },
-    { key: 'unknown', label: 'Other Slates' }
-  ];
-  const sorted = [...slatesCache].sort((a,b) => (a.startTime||'').localeCompare(b.startTime||''));
-  groups.forEach(g => {
-    const items = sorted.filter(s => s.kind === g.key);
-    if(!items.length) return;
-    const optgroup = document.createElement('optgroup');
-    optgroup.label = g.label;
-    items.forEach(s => {
-      const opt = document.createElement('option');
-      opt.value = s.draftGroupId;
-      opt.textContent = slateLabel(s);
-      optgroup.appendChild(opt);
+function renderDateTabs(){
+  const container = document.getElementById('dateTabs');
+  container.innerHTML = '';
+  const keys = Array.from(new Set(slatesCache.map(s => s.dateKey))).sort();
+  keys.forEach(k => {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'chip' + (k === selectedDate ? ' active' : '');
+    chip.textContent = dateTabLabel(k);
+    chip.addEventListener('click', () => {
+      selectedDate = k;
+      renderDateTabs();
+      renderSlateTable();
     });
-    select.appendChild(optgroup);
+    container.appendChild(chip);
+  });
+}
+
+function renderTypeTabs(){
+  const container = document.getElementById('typeTabs');
+  container.innerHTML = '';
+  [{ key: 'all', label: 'All' }, { key: 'classic', label: 'Classic' }, { key: 'showdown', label: 'Showdown' }]
+    .forEach(t => {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'chip' + (t.key === selectedType ? ' active' : '');
+      chip.textContent = t.label;
+      chip.addEventListener('click', () => {
+        selectedType = t.key;
+        renderTypeTabs();
+        renderSlateTable();
+      });
+      container.appendChild(chip);
+    });
+}
+
+function renderSlateTable(){
+  const container = document.getElementById('slateTable');
+  container.innerHTML = '';
+  const filtered = slatesCache
+    .filter(s => s.dateKey === selectedDate)
+    .filter(s => selectedType === 'all' || s.kind === selectedType)
+    .sort((a, b) => {
+      const at = a.startTime || '', bt = b.startTime || '';
+      if(at !== bt) return at.localeCompare(bt);
+      return (b.gameCount || 0) - (a.gameCount || 0);
+    });
+
+  if(!filtered.length){
+    container.innerHTML = '<div class="slateEmpty">No slates match this date/type.</div>';
+    return;
+  }
+
+  filtered.forEach(s => {
+    const row = document.createElement('div');
+    row.className = 'slateRow' + (String(s.draftGroupId) === String(activeDraftGroupId) ? ' active' : '');
+    const typeLabel = s.kind === 'classic' ? 'Classic' : (s.kind === 'showdown' ? 'Showdown' : '');
+    row.innerHTML =
+      '<div class="srMain">' +
+        '<div class="srLabel">' + slateRowLabel(s) + '</div>' +
+        '<div class="srMeta">' + (formatDate(s.startTime) || 'date unknown') + (typeLabel ? ' — ' + typeLabel : '') + '</div>' +
+      '</div>' +
+      '<div class="srGames">' + (s.gameCount ? (s.gameCount + ' game' + (s.gameCount === 1 ? '' : 's')) : '') + '</div>';
+    row.addEventListener('click', () => onSlateChange(s.draftGroupId));
+    container.appendChild(row);
   });
 }
 
@@ -467,13 +566,20 @@ async function loadSlatesAndContests(){
     slatesCache = deriveSlates(data, contestsCache);
     if(!slatesCache.length) throw new Error('Could not identify any slates from the response.');
 
-    renderSlateOptions();
+    const dates = Array.from(new Set(slatesCache.map(s => s.dateKey))).sort();
+    selectedDate = dates[0];
+    selectedType = 'all';
+    renderDateTabs();
+    renderTypeTabs();
+    renderSlateTable();
     document.getElementById('slateLoadStatus').textContent = '';
     setFetchStatus('Loaded ' + slatesCache.length + ' slates and ' + contestsCache.length + ' contests.');
 
-    // Auto-select the soonest slate and pull its pool right away.
-    const first = document.getElementById('slateSelect').value;
-    if(first) await onSlateChange(first);
+    // Auto-select the soonest slate on the default date and pull its pool right away.
+    const firstOfDay = slatesCache
+      .filter(s => s.dateKey === selectedDate)
+      .sort((a,b) => (b.gameCount||0) - (a.gameCount||0))[0];
+    if(firstOfDay) await onSlateChange(firstOfDay.draftGroupId);
   } catch(err){
     document.getElementById('slateLoadStatus').textContent = '';
     setFetchStatus('Could not auto-load slates: ' + (err.message || err) + ' This is an unofficial DraftKings endpoint — your browser may be blocking the cross-origin request (CORS), or the format changed. Use "Enter draft group ID manually" below instead.', true);
@@ -505,12 +611,16 @@ async function fetchPoolForDraftGroup(draftGroupId){
 }
 
 async function onSlateChange(draftGroupId){
+  activeDraftGroupId = draftGroupId;
   const slate = slatesCache.find(s => String(s.draftGroupId) === String(draftGroupId));
-  if(slate) document.getElementById('weekLabel').value = 'NFL — ' + slateLabel(slate);
+  if(slate){
+    document.getElementById('weekLabel').value = 'NFL — ' + (formatDate(slate.startTime) || 'date unknown') + ' — ' + slateRowLabel(slate);
+    document.getElementById('salaryCap').value = slate.salaryCap || 50000;
+  }
+  renderSlateTable();
   renderContestOptionsForSlate(draftGroupId);
   await fetchPoolForDraftGroup(draftGroupId);
 }
-document.getElementById('slateSelect').addEventListener('change', (e) => onSlateChange(e.target.value));
 document.getElementById('refreshSlatesBtn').addEventListener('click', loadSlatesAndContests);
 
 document.getElementById('contestSelect').addEventListener('change', (e) => {
