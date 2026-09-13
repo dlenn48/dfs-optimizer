@@ -1708,6 +1708,9 @@ async function generateLineups(){
           p.avgPts = hist[key].avg; // real recent form takes priority when we have it
           p.dataConfidence = hist[key].confidence;
         }
+        if(p.pos === 'QB' && key === normalizePlayerName('Carson Wentz')){
+          console.log('[Historical Stats] Carson Wentz -> DK-embedded avgPts before override:', p.avgPts, '| historical match found:', hist[key], '| salary:', p.salary);
+        }
       });
 
       const defenseMatchups = await fetchDefenseMatchups();
@@ -1729,10 +1732,12 @@ async function generateLineups(){
       });
 
       const qbDepth = await fetchQbDepthChart();
+      console.log('[QB Depth Chart] entries loaded:', Object.keys(qbDepth).length, '| carson wentz ->', qbDepth[normalizePlayerName('Carson Wentz')], '| daniel jones ->', qbDepth[normalizePlayerName('Daniel Jones')]);
       pool.forEach(p => {
         if(p.pos !== 'QB') return;
         const key = normalizePlayerName(p.name);
         if(qbDepth[key] != null) p.qbDepthRank = qbDepth[key];
+        if(p.pos === 'QB') console.log('[QB Depth Chart] pool player:', JSON.stringify(p.name), '-> key:', JSON.stringify(key), '-> rank found:', qbDepth[key]);
       });
     }
     computeProjections(pool);
