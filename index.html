@@ -580,70 +580,68 @@ function gameScriptFactor(pos, spread){
 
 function computeProjections(pool){
   pool.forEach(p => {
-    let proj = baselineProjection(p);
+    const baseline = baselineProjection(p);
 
-    // Coded injury discount (DraftKings' own status tag), refined further
-    // with real practice-participation data when we have it — a Questionable
-    // player who practiced fully all week is a very different bet than one
-    // who didn't practice at all, even though DK tags them identically.
-    if(ZERO_OUT_STATUSES.has(p.injuryStatus)) proj = 0;
-    else if(p.injuryStatus === 'D') proj *= 0.8;
+    // "Hard" injury news is handled first and separately from everything
+    // else below — a genuine Out/Doubtful should zero out or heavily
+    // discount regardless of how good the matchup otherwise looks.
+    if(ZERO_OUT_STATUSES.has(p.injuryStatus)){ p.proj = 0; return; }
+
+    let injuryFactor = 1;
+    if(p.injuryStatus === 'D') injuryFactor = 0.8;
     else if(p.injuryStatus === 'Q' || p.injuryStatus === 'GTD'){
       const ps = p.practiceStatus || '';
-      if(/DID NOT PARTICIPATE|DNP/.test(ps)) proj *= 0.82;
-      else if(/LIMITED/.test(ps)) proj *= 0.90;
-      else if(/FULL/.test(ps)) proj *= 0.97;
-      else proj *= 0.93; // no practice data — fall back to the flat discount
+      if(/DID NOT PARTICIPATE|DNP/.test(ps)) injuryFactor = 0.82;
+      else if(/LIMITED/.test(ps)) injuryFactor = 0.90;
+      else if(/FULL/.test(ps)) injuryFactor = 0.97;
+      else injuryFactor = 0.93; // no practice data — fall back to the flat discount
     }
 
-    // Coded weather adjustment for outdoor stadiums, at the actual kickoff hour.
+    // Every other signal (weather, Vegas, game script, matchup, snap trend)
+    // is "soft" contextual nudging. Each is individually clamped to a modest
+    // range, but multiplying several of them together — even when each is
+    // reasonable on its own — can compound into an unrealistic swing (e.g.
+    // five factors each pointing +10-15% the same direction stacking into a
+    // 60-70% total boost). The combined product gets clamped as a whole
+    // right before it's applied, so the total soft-signal swing stays sane
+    // regardless of how many individual factors happen to line up.
+    let soft = 1;
+
     const w = p.weather;
     if(w){
-      if(['QB','WR','TE'].includes(p.pos)) proj *= windPassFactor(w.wind) * precipPassFactor(w.precip);
-      if(p.pos === 'RB') proj *= windRushFactor(w.wind);
+      if(['QB','WR','TE'].includes(p.pos)) soft *= windPassFactor(w.wind) * precipPassFactor(w.precip);
+      if(p.pos === 'RB') soft *= windRushFactor(w.wind);
     }
 
-    // Coded Vegas total adjustment: scale toward a team's implied total
-    // relative to league average (~22.5). DST scales the opposite way — a
-    // low-scoring opponent is good for defense. Clamp kept fairly tight: a
-    // team total is a blunt, team-wide signal (it doesn't know which
-    // positions actually benefit against a given defense), so it should
-    // nudge projections, not dominate them.
     const LEAGUE_AVG_TEAM_TOTAL = 22.5;
     function clampFactor(f){ return Math.max(0.9, Math.min(1.15, f)); }
     if(p.pos !== 'DST' && p.impliedTotal != null){
-      proj *= clampFactor(p.impliedTotal / LEAGUE_AVG_TEAM_TOTAL);
+      soft *= clampFactor(p.impliedTotal / LEAGUE_AVG_TEAM_TOTAL);
     } else if(p.pos === 'DST' && p.oppImpliedTotal != null){
-      proj *= clampFactor(LEAGUE_AVG_TEAM_TOTAL / Math.max(p.oppImpliedTotal, 1));
+      soft *= clampFactor(LEAGUE_AVG_TEAM_TOTAL / Math.max(p.oppImpliedTotal, 1));
     }
 
-    // Coded game-script adjustment from spread magnitude.
     if(p.pos !== 'DST'){
-      proj *= gameScriptFactor(p.pos, p.spread);
+      soft *= gameScriptFactor(p.pos, p.spread);
     }
 
-    // Real defense-vs-pass / defense-vs-rush adjustment, computed from
-    // nflverse's per-game opponent data (see fetchDefenseMatchups).
     if(p.pos === 'QB' || p.pos === 'WR' || p.pos === 'TE'){
-      if(p.oppDefense && p.oppDefense.passFactor != null) proj *= p.oppDefense.passFactor;
+      if(p.oppDefense && p.oppDefense.passFactor != null) soft *= p.oppDefense.passFactor;
     } else if(p.pos === 'RB'){
-      if(p.oppDefense && p.oppDefense.rushFactor != null) proj *= p.oppDefense.rushFactor;
+      if(p.oppDefense && p.oppDefense.rushFactor != null) soft *= p.oppDefense.rushFactor;
     }
 
-    // Real DST scoring bonus from actual sack/interception production,
-    // computed from the same nflverse team-week fetch (see fetchDefenseMatchups).
     if(p.pos === 'DST' && p.ownDefense && p.ownDefense.turnoverFactor != null){
-      proj *= p.ownDefense.turnoverFactor;
+      soft *= p.ownDefense.turnoverFactor;
     }
 
-    // Snap-share role trend from real PFR data — a climbing role is treated
-    // as a modest tailwind, a shrinking one as a modest headwind. Kept small
-    // since this is directional signal, not a precise multiplier.
     if(p.snapTrend != null){
-      proj *= Math.max(0.92, Math.min(1.1, 1 + p.snapTrend * 0.5));
+      soft *= Math.max(0.92, Math.min(1.1, 1 + p.snapTrend * 0.5));
     }
 
-    p.proj = Math.round(proj * 10) / 10;
+    soft = Math.max(0.75, Math.min(1.3, soft)); // the combined-swing clamp
+
+    p.proj = Math.round(baseline * injuryFactor * soft * 10) / 10;
   });
 }
 
