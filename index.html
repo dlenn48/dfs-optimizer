@@ -335,7 +335,9 @@ const STADIUMS = {
 function normalizePlayer(p){
   const name = p.displayName || p.DisplayName ||
     ((p.firstName || p.FirstName || '') + ' ' + (p.lastName || p.LastName || '')).trim() || 'Unknown';
-  const pos = (p.position || p.Position || '').toUpperCase();
+  const posRaw = (p.position || p.Position || '').toString().trim().toUpperCase();
+  const posAliases = { DEF: 'DST', 'D/ST': 'DST', D: 'DST' };
+  const pos = posAliases[posRaw] || posRaw;
   const team = (p.teamAbbreviation || p.TeamAbbreviation || '').toUpperCase();
   const opp = (p.competition && (p.competition.name || p.competition.Name)) ||
     (p.draftAlerts && p.draftAlerts.opponent) || '';
@@ -879,7 +881,20 @@ async function generateLineups(){
     computeProjections(pool);
 
     const lineup1 = buildLineup(pool, fields.salaryCap, []);
-    if(!lineup1) throw new Error('Could not build a valid lineup from this pool — it may be missing a position DraftKings requires (QB/RB/WR/TE/DST).');
+    if(!lineup1){
+      const allCounts = {};
+      const eligibleCounts = {};
+      pool.forEach(p => {
+        const key = p.pos || '(blank)';
+        allCounts[key] = (allCounts[key] || 0) + 1;
+        if(p.proj > 0 && p.salary > 0) eligibleCounts[key] = (eligibleCounts[key] || 0) + 1;
+      });
+      throw new Error(
+        'Could not build a valid lineup from this pool. Position counts in the raw pool: ' + JSON.stringify(allCounts) +
+        '. Eligible (salary>0 and proj>0) counts: ' + JSON.stringify(eligibleCounts) +
+        '. If a position DraftKings needs (QB/RB/WR/TE/DST) is missing or zero here, the "pos" field parsing likely needs adjusting for this slate\'s data shape.'
+      );
+    }
 
     const lockOutIds = lineup1.roster
       .slice()
