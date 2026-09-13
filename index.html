@@ -624,8 +624,8 @@ async function fetchVegasLines(dateKey){
 }
 
 // Real recent-form data from nflverse's public weekly player stats, used to
-// replace the crude salary-based projection fallback with actual production
-// over a player's last few games.
+// replace the crude salary-based projection fallback with a real
+// season-to-date points-per-game average.
 function normalizePlayerName(name){
   return (name || '').toLowerCase()
     .replace(/[^a-z ]/g, '')
@@ -650,26 +650,21 @@ async function fetchHistoricalStats(){
     const rows = parsed.data || [];
     if(!rows.length) throw new Error('CSV came back empty.');
 
-    const byPlayer = {};
+    // This file holds season-to-date TOTALS (no per-week rows), so the best
+    // real-data signal available here is points-per-game so far this season
+    // — not a recent-form trend, but genuine accumulated performance rather
+    // than a salary-derived guess.
+    const result = {};
     rows.forEach(r => {
       const name = r.player_display_name || r.player_name;
-      const week = Number(r.week);
+      const games = Number(r.games);
       const pts = r.fantasy_points_ppr != null ? Number(r.fantasy_points_ppr) : Number(r.fantasy_points);
-      if(!name || isNaN(week) || isNaN(pts)) return;
+      if(!name || !games || isNaN(games) || isNaN(pts)) return;
       const key = normalizePlayerName(name);
-      if(!byPlayer[key]) byPlayer[key] = [];
-      byPlayer[key].push({ week, pts });
-    });
-
-    const result = {};
-    Object.keys(byPlayer).forEach(key => {
-      const games = byPlayer[key].sort((a, b) => b.week - a.week).slice(0, 4); // last up to 4 games
-      if(!games.length) return;
-      const avg = games.reduce((s, g) => s + g.pts, 0) / games.length;
-      result[key] = Math.round(avg * 10) / 10;
+      result[key] = Math.round((pts / games) * 10) / 10;
     });
     historicalStatsCache = result;
-    setEndpointStatus('historical', 'ok', 'Loaded recent-form data for ' + Object.keys(result).length + ' players.');
+    setEndpointStatus('historical', 'ok', 'Loaded season-average data for ' + Object.keys(result).length + ' players.');
     return result;
   } catch(err){
     historicalStatsCache = {};
