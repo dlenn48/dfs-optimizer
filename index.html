@@ -823,8 +823,8 @@ let historicalStatsCache = null;
 async function fetchHistoricalStats(){
   if(historicalStatsCache) return historicalStatsCache;
   const proxy = getProxyUrl();
-  if(!proxy){ historicalStatsCache = {}; setEndpointStatus('historical', 'skipped', 'No Proxy URL set.'); return {}; }
-  if(typeof Papa === 'undefined'){ historicalStatsCache = {}; setEndpointStatus('historical', 'error', 'CSV parser (PapaParse) failed to load.'); return {}; }
+  if(!proxy){ setEndpointStatus('historical', 'skipped', 'No Proxy URL set.'); return {}; }
+  if(typeof Papa === 'undefined'){ setEndpointStatus('historical', 'error', 'CSV parser (PapaParse) failed to load.'); return {}; }
   setEndpointStatus('historical', 'pending', 'Fetching historical stats…');
   try{
     const season = new Date().getFullYear();
@@ -869,7 +869,7 @@ async function fetchHistoricalStats(){
     );
     return result;
   } catch(err){
-    historicalStatsCache = {};
+    // historicalStatsCache left unset on failure so the next attempt actually retries.
     setEndpointStatus('historical', 'error', String(err.message || err));
     return {};
   }
@@ -886,8 +886,8 @@ let defenseMatchupCache = null;
 async function fetchDefenseMatchups(){
   if(defenseMatchupCache) return defenseMatchupCache;
   const proxy = getProxyUrl();
-  if(!proxy){ defenseMatchupCache = {}; setEndpointStatus('defense', 'skipped', 'No Proxy URL set.'); return {}; }
-  if(typeof Papa === 'undefined'){ defenseMatchupCache = {}; setEndpointStatus('defense', 'error', 'CSV parser (PapaParse) failed to load.'); return {}; }
+  if(!proxy){ setEndpointStatus('defense', 'skipped', 'No Proxy URL set.'); return {}; }
+  if(typeof Papa === 'undefined'){ setEndpointStatus('defense', 'error', 'CSV parser (PapaParse) failed to load.'); return {}; }
   setEndpointStatus('defense', 'pending', 'Fetching defense matchup data…');
   try{
     const season = new Date().getFullYear();
@@ -957,7 +957,7 @@ async function fetchDefenseMatchups(){
     setEndpointStatus('defense', 'ok', 'Computed pass/rush/turnover defense splits for ' + teams.length + ' teams.');
     return result;
   } catch(err){
-    defenseMatchupCache = {};
+    // defenseMatchupCache left unset on failure so the next attempt actually retries.
     setEndpointStatus('defense', 'error', String(err.message || err));
     return {};
   }
@@ -971,8 +971,8 @@ let injuryPracticeCache = null;
 async function fetchInjuryPracticeData(){
   if(injuryPracticeCache) return injuryPracticeCache;
   const proxy = getProxyUrl();
-  if(!proxy){ injuryPracticeCache = {}; setEndpointStatus('injuries', 'skipped', 'No Proxy URL set.'); return {}; }
-  if(typeof Papa === 'undefined'){ injuryPracticeCache = {}; setEndpointStatus('injuries', 'error', 'CSV parser failed to load.'); return {}; }
+  if(!proxy){ setEndpointStatus('injuries', 'skipped', 'No Proxy URL set.'); return {}; }
+  if(typeof Papa === 'undefined'){ setEndpointStatus('injuries', 'error', 'CSV parser failed to load.'); return {}; }
   setEndpointStatus('injuries', 'pending', 'Fetching practice reports…');
   try{
     const season = new Date().getFullYear();
@@ -999,7 +999,7 @@ async function fetchInjuryPracticeData(){
     setEndpointStatus('injuries', 'ok', 'Loaded practice reports for ' + Object.keys(latest).length + ' players.');
     return latest;
   } catch(err){
-    injuryPracticeCache = {};
+    // injuryPracticeCache left unset on failure so the next attempt actually retries.
     setEndpointStatus('injuries', 'error', String(err.message || err));
     return {};
   }
@@ -1018,8 +1018,8 @@ let qbDepthChartCache = null;
 async function fetchQbDepthChart(){
   if(qbDepthChartCache) return qbDepthChartCache;
   const proxy = getProxyUrl();
-  if(!proxy){ qbDepthChartCache = {}; setEndpointStatus('depthChart', 'skipped', 'No Proxy URL set.'); return {}; }
-  if(typeof Papa === 'undefined'){ qbDepthChartCache = {}; setEndpointStatus('depthChart', 'error', 'CSV parser failed to load.'); return {}; }
+  if(!proxy){ setEndpointStatus('depthChart', 'skipped', 'No Proxy URL set.'); return {}; }
+  if(typeof Papa === 'undefined'){ setEndpointStatus('depthChart', 'error', 'CSV parser failed to load.'); return {}; }
   setEndpointStatus('depthChart', 'pending', 'Fetching QB depth chart…');
   try{
     const season = new Date().getFullYear();
@@ -1049,7 +1049,7 @@ async function fetchQbDepthChart(){
     );
     return result;
   } catch(err){
-    qbDepthChartCache = {};
+    // qbDepthChartCache left unset on failure so the next attempt actually retries.
     setEndpointStatus('depthChart', 'error', String(err.message || err));
     return {};
   }
@@ -1058,8 +1058,8 @@ async function fetchQbDepthChart(){
 async function fetchSnapCountTrends(){
   if(snapTrendCache) return snapTrendCache;
   const proxy = getProxyUrl();
-  if(!proxy){ snapTrendCache = {}; setEndpointStatus('snaps', 'skipped', 'No Proxy URL set.'); return {}; }
-  if(typeof Papa === 'undefined'){ snapTrendCache = {}; setEndpointStatus('snaps', 'error', 'CSV parser failed to load.'); return {}; }
+  if(!proxy){ setEndpointStatus('snaps', 'skipped', 'No Proxy URL set.'); return {}; }
+  if(typeof Papa === 'undefined'){ setEndpointStatus('snaps', 'error', 'CSV parser failed to load.'); return {}; }
   setEndpointStatus('snaps', 'pending', 'Fetching snap count trends…');
   try{
     const season = new Date().getFullYear();
@@ -1096,7 +1096,7 @@ async function fetchSnapCountTrends(){
     setEndpointStatus('snaps', 'ok', 'Loaded snap trends for ' + Object.keys(result).length + ' players.');
     return result;
   } catch(err){
-    snapTrendCache = {};
+    // snapTrendCache left unset on failure so the next attempt actually retries.
     setEndpointStatus('snaps', 'error', String(err.message || err));
     return {};
   }
