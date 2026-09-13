@@ -321,7 +321,7 @@ function slugify(s){
 const endpointStatus = {
   dkContests: { label: 'DK Contests', state: 'idle', detail: 'Not loaded yet.' },
   dkPool: { label: 'DK Player Pool', state: 'idle', detail: 'Pick a slate to fetch.' },
-  vegas: { label: 'Vegas Lines (ESPN)', state: 'idle', detail: 'Runs during Generate.' },
+  vegas: { label: 'Vegas Lines (Odds API)', state: 'idle', detail: 'Runs during Generate.' },
   historical: { label: 'Historical Stats (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
   weather: { label: 'Weather (Open-Meteo)', state: 'idle', detail: 'Runs during Generate.' }
 };
@@ -569,14 +569,20 @@ function computeProjections(pool){
   });
 }
 
-// Vegas lines (implied team totals) via ESPN's public scoreboard, proxied
-// through the Worker. Used to scale projections toward high/low-scoring
-// game environments — one of the strongest free signals available.
-const ESPN_TEAM_OVERRIDES = { WSH: 'WAS' };
-function espnToDkTeam(abbr){
-  const a = (abbr || '').toUpperCase();
-  return ESPN_TEAM_OVERRIDES[a] || a;
-}
+// Vegas lines (implied team totals) via The Odds API, proxied through the
+// Worker. Used to scale projections toward high/low-scoring game
+// environments — one of the strongest free signals available. (Switched
+// from ESPN's scoreboard after Akamai's bot protection blocked that route.)
+const TEAM_NAME_TO_ABBR = {
+  'Arizona Cardinals':'ARI','Atlanta Falcons':'ATL','Baltimore Ravens':'BAL','Buffalo Bills':'BUF',
+  'Carolina Panthers':'CAR','Chicago Bears':'CHI','Cincinnati Bengals':'CIN','Cleveland Browns':'CLE',
+  'Dallas Cowboys':'DAL','Denver Broncos':'DEN','Detroit Lions':'DET','Green Bay Packers':'GB',
+  'Houston Texans':'HOU','Indianapolis Colts':'IND','Jacksonville Jaguars':'JAX','Kansas City Chiefs':'KC',
+  'Los Angeles Chargers':'LAC','Los Angeles Rams':'LAR','Las Vegas Raiders':'LV','Miami Dolphins':'MIA',
+  'Minnesota Vikings':'MIN','New England Patriots':'NE','New Orleans Saints':'NO','New York Giants':'NYG',
+  'New York Jets':'NYJ','Philadelphia Eagles':'PHI','Pittsburgh Steelers':'PIT','Seattle Seahawks':'SEA',
+  'San Francisco 49ers':'SF','Tampa Bay Buccaneers':'TB','Tennessee Titans':'TEN','Washington Commanders':'WAS'
+};
 
 const vegasCache = {};
 async function fetchVegasLines(dateKey){
@@ -585,29 +591,32 @@ async function fetchVegasLines(dateKey){
   if(!proxy){ vegasCache[dateKey] = {}; setEndpointStatus('vegas', 'skipped', 'No Proxy URL set.'); return {}; }
   setEndpointStatus('vegas', 'pending', 'Fetching Vegas lines…');
   try{
-    const ymd = dateKey.replace(/-/g, '');
-    const res = await fetch(proxy + '/espn/scoreboard?dates=' + ymd);
-    if(!res.ok) throw new Error('scoreboard HTTP ' + res.status);
-    const data = await res.json();
+    const res = await fetch(proxy + '/oddsapi/nfl');
+    if(!res.ok) throw new Error('odds API HTTP ' + res.status);
+    const games = await res.json();
+    if(!Array.isArray(games)) throw new Error(games && games.error ? games.error : 'Unexpected response shape.');
+
     const totals = {};
-    (data.events || []).forEach(ev => {
-      const comp = ev.competitions && ev.competitions[0];
-      if(!comp) return;
-      const competitors = comp.competitors || [];
-      const odds = (comp.odds && comp.odds[0]) || null;
-      if(!odds || odds.overUnder == null) return;
-      const overUnder = Number(odds.overUnder);
-      let favTeam = null, margin = 0;
-      const detailsMatch = (odds.details || '').match(/([A-Z]{2,3})\s*-\s*([\d.]+)/);
-      if(detailsMatch){ favTeam = espnToDkTeam(detailsMatch[1]); margin = parseFloat(detailsMatch[2]); }
-      competitors.forEach(c => {
-        const abbr = espnToDkTeam(c.team && c.team.abbreviation);
-        if(!abbr) return;
-        let implied = overUnder / 2;
-        if(favTeam) implied += (abbr === favTeam ? margin / 2 : -margin / 2);
-        totals[abbr] = Math.round(implied * 10) / 10;
-      });
+    games.forEach(g => {
+      const home = TEAM_NAME_TO_ABBR[g.home_team];
+      const away = TEAM_NAME_TO_ABBR[g.away_team];
+      if(!home || !away) return;
+      const book = (g.bookmakers && g.bookmakers[0]) || null;
+      if(!book) return;
+      const totalsMarket = (book.markets || []).find(m => m.key === 'totals');
+      const spreadsMarket = (book.markets || []).find(m => m.key === 'spreads');
+      if(!totalsMarket || !totalsMarket.outcomes || !totalsMarket.outcomes.length) return;
+
+      const overUnder = Number(totalsMarket.outcomes[0].point);
+      let homeSpread = 0;
+      if(spreadsMarket){
+        const homeOutcome = (spreadsMarket.outcomes || []).find(o => o.name === g.home_team);
+        if(homeOutcome) homeSpread = Number(homeOutcome.point); // negative = home favored
+      }
+      totals[home] = Math.round((overUnder / 2 - homeSpread / 2) * 10) / 10;
+      totals[away] = Math.round((overUnder / 2 + homeSpread / 2) * 10) / 10;
     });
+
     vegasCache[dateKey] = totals;
     const teamCount = Object.keys(totals).length;
     if(teamCount){
