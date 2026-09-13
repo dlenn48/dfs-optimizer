@@ -404,18 +404,29 @@ function deriveSlates(data, contests){
   let slates;
   if(rawGroups.length){
     const byId = new Map();
+    const seenVisual = new Set();
     rawGroups.forEach(g => {
       const draftGroupId = g.DraftGroupId ?? g.draftGroupId ?? g.Id;
-      if(draftGroupId == null || byId.has(draftGroupId)) return; // dedupe repeated entries for the same slate
+      if(draftGroupId == null || byId.has(draftGroupId)) return;
       const games = g.Games || g.games || [];
       const gameCount = games.length || g.GameCount || g.gameCount || null;
+      const startTime = g.StartDateEst ?? g.startDate ?? g.StartDate ?? g.ContestStartTime ?? g.startTime ?? null;
+      const tag = g.DraftGroupTag || g.ContestStartTimeSuffix || g.Description || '';
+      const kind = gameCount === 1 ? 'showdown' : (gameCount > 1 ? 'classic' : 'unknown');
+      // Collapse rows that would look identical in the picker (same tag, game
+      // count, start time, and type) even if DraftKings gave them distinct
+      // IDs — likely separate contest formats or eligibility variants that
+      // share the same underlying player pool, so showing them all is noise.
+      const visualKey = tag + '|' + gameCount + '|' + startTime + '|' + kind;
+      if(seenVisual.has(visualKey)) return;
+      seenVisual.add(visualKey);
       byId.set(draftGroupId, {
         draftGroupId,
-        startTime: g.StartDateEst ?? g.startDate ?? g.StartDate ?? g.ContestStartTime ?? g.startTime ?? null,
-        gameCount: gameCount,
-        tag: g.DraftGroupTag || g.ContestStartTimeSuffix || g.Description || '',
+        startTime,
+        gameCount,
+        tag,
         matchup: gameCount === 1 ? extractMatchup(games[0]) : null,
-        kind: gameCount === 1 ? 'showdown' : (gameCount > 1 ? 'classic' : 'unknown')
+        kind
       });
     });
     slates = Array.from(byId.values());
