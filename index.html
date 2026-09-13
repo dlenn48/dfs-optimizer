@@ -6,6 +6,7 @@
 <title>Lineup Builder</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
 <style>
   :root{
     --bg: #101F19;
@@ -380,9 +381,24 @@ function normalizePlayer(p){
   }
   if(!opp) opp = (p.draftAlerts && p.draftAlerts.opponent) || '';
 
+  // Best-guess extraction of this specific game's kickoff time, so weather
+  // can be checked at the actual hour rather than a generic afternoon window
+  // — matters when a slate spans early/late/primetime windows together.
+  let kickoffHour = null;
+  const kickoffRaw = (p.competition && (p.competition.startTime || p.competition.StartTime)) ||
+    p.startTime || p.StartDate || null;
+  if(kickoffRaw){
+    const kd = new Date(kickoffRaw);
+    if(!isNaN(kd.getTime())){
+      try{
+        kickoffHour = Number(kd.toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', hour12: false }));
+      } catch(e){ kickoffHour = null; }
+    }
+  }
+
   return {
     id: p.playerId || p.PlayerId || p.draftableId || p.DraftableId || (name + team),
-    name, pos, team, opp, salary, injuryStatus, avgPts, homeTeam
+    name, pos, team, opp, salary, injuryStatus, avgPts, homeTeam, kickoffHour
   };
 }
 
@@ -403,60 +419,189 @@ function baselineProjection(p){
 }
 
 const weatherCache = {};
-async function fetchWeatherForTeam(team, dateKey){
+async function fetchWeatherForTeam(team, dateKey, hour){
   const stadium = STADIUMS[team];
   if(!stadium || stadium.dome) return null;
-  const cacheKey = team + '|' + dateKey;
-  if(weatherCache[cacheKey] !== undefined) return weatherCache[cacheKey];
-  try{
-    const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + stadium.lat + '&longitude=' + stadium.lon +
-      '&hourly=windspeed_10m,precipitation_probability&windspeed_unit=mph' +
-      '&start_date=' + dateKey + '&end_date=' + dateKey + '&timezone=America%2FNew_York';
-    const res = await fetch(url);
-    if(!res.ok) throw new Error('weather HTTP ' + res.status);
-    const data = await res.json();
-    const winds = (data.hourly && data.hourly.windspeed_10m) || [];
-    const precs = (data.hourly && data.hourly.precipitation_probability) || [];
-    // Use the midday-ish hours as a rough stand-in for game time since we
-    // don't reliably know exact kickoff hour per team here.
-    const wind = winds.length ? Math.max(...winds.slice(10, 20)) : null;
-    const precip = precs.length ? Math.max(...precs.slice(10, 20)) : null;
-    const result = { wind, precip };
-    weatherCache[cacheKey] = result;
-    return result;
-  } catch(err){
-    weatherCache[cacheKey] = null;
-    return null;
+  const cacheKey = team + '|' + dateKey; // one fetch per team/day; hour picked from the result below
+  let dayData = weatherCache[cacheKey];
+  if(dayData === undefined){
+    try{
+      const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + stadium.lat + '&longitude=' + stadium.lon +
+        '&hourly=windspeed_10m,precipitation_probability&windspeed_unit=mph' +
+        '&start_date=' + dateKey + '&end_date=' + dateKey + '&timezone=America%2FNew_York';
+      const res = await fetch(url);
+      if(!res.ok) throw new Error('weather HTTP ' + res.status);
+      const data = await res.json();
+      dayData = {
+        winds: (data.hourly && data.hourly.windspeed_10m) || [],
+        precs: (data.hourly && data.hourly.precipitation_probability) || []
+      };
+    } catch(err){
+      dayData = null;
+    }
+    weatherCache[cacheKey] = dayData;
   }
+  if(!dayData) return null;
+
+  // Use the actual kickoff hour when we have it; otherwise fall back to a
+  // 1pm ET assumption (the most common NFL Sunday window).
+  const h = (hour != null && hour >= 0 && hour <= 23) ? hour : 13;
+  const wind = dayData.winds.length ? dayData.winds[Math.min(h, dayData.winds.length - 1)] : null;
+  const precip = dayData.precs.length ? dayData.precs[Math.min(h, dayData.precs.length - 1)] : null;
+  return { wind, precip };
 }
 
 async function enrichWithWeather(pool, dateKey){
-  const homeTeams = Array.from(new Set(pool.map(p => p.homeTeam).filter(Boolean)));
-  const weatherByTeam = {};
-  await Promise.all(homeTeams.map(async team => {
-    weatherByTeam[team] = await fetchWeatherForTeam(team, dateKey);
+  // Key by team + kickoff hour, since a combined slate (e.g. "Sun-Mon") can
+  // span early, late, and primetime windows with different conditions.
+  const groups = new Map();
+  pool.forEach(p => {
+    if(!p.homeTeam) return;
+    const hour = p.kickoffHour != null ? p.kickoffHour : 13;
+    const key = p.homeTeam + '|' + hour;
+    if(!groups.has(key)) groups.set(key, { team: p.homeTeam, hour });
+  });
+  const weatherByKey = {};
+  await Promise.all(Array.from(groups.entries()).map(async ([key, g]) => {
+    weatherByKey[key] = await fetchWeatherForTeam(g.team, dateKey, g.hour);
   }));
-  pool.forEach(p => { p.weather = p.homeTeam ? weatherByTeam[p.homeTeam] : null; });
+  pool.forEach(p => {
+    if(!p.homeTeam){ p.weather = null; return; }
+    const hour = p.kickoffHour != null ? p.kickoffHour : 13;
+    p.weather = weatherByKey[p.homeTeam + '|' + hour];
+  });
 }
+
+// Statuses that mean a player has ~zero chance of playing. Covers a few more
+// DraftKings/real-world variants than just Q/D/O.
+const ZERO_OUT_STATUSES = new Set(['O','OUT','IR','IR-R','PUP','NA','SUSP','DNP','RESERVE']);
 
 function computeProjections(pool){
   pool.forEach(p => {
     let proj = baselineProjection(p);
 
     // Coded injury discount (no AI — just DraftKings' own status tag).
-    if(p.injuryStatus === 'Q') proj *= 0.93;
+    if(ZERO_OUT_STATUSES.has(p.injuryStatus)) proj = 0;
     else if(p.injuryStatus === 'D') proj *= 0.8;
-    else if(p.injuryStatus === 'O' || p.injuryStatus === 'OUT' || p.injuryStatus === 'IR') proj = 0;
+    else if(p.injuryStatus === 'Q' || p.injuryStatus === 'GTD') proj *= 0.93;
 
-    // Coded weather adjustment for outdoor stadiums.
+    // Coded weather adjustment for outdoor stadiums, at the actual kickoff hour.
     const w = p.weather;
     if(w){
       if(w.wind != null && w.wind >= 15 && ['QB','WR','TE'].includes(p.pos)) proj *= 0.9;
       if(w.wind != null && w.wind >= 15 && p.pos === 'RB') proj *= 1.05;
       if(w.precip != null && w.precip >= 50 && ['QB','WR','TE'].includes(p.pos)) proj *= 0.95;
     }
+
+    // Coded Vegas adjustment: scale toward a team's implied total relative to
+    // a league-average implied total (~22.5, i.e. a ~45-point game split evenly).
+    // DST scales the opposite way — a low-scoring opponent is good for defense.
+    const LEAGUE_AVG_TEAM_TOTAL = 22.5;
+    function clampFactor(f){ return Math.max(0.8, Math.min(1.25, f)); }
+    if(p.pos !== 'DST' && p.impliedTotal != null){
+      proj *= clampFactor(p.impliedTotal / LEAGUE_AVG_TEAM_TOTAL);
+    } else if(p.pos === 'DST' && p.oppImpliedTotal != null){
+      proj *= clampFactor(LEAGUE_AVG_TEAM_TOTAL / Math.max(p.oppImpliedTotal, 1));
+    }
+
     p.proj = Math.round(proj * 10) / 10;
   });
+}
+
+// Vegas lines (implied team totals) via ESPN's public scoreboard, proxied
+// through the Worker. Used to scale projections toward high/low-scoring
+// game environments — one of the strongest free signals available.
+const ESPN_TEAM_OVERRIDES = { WSH: 'WAS' };
+function espnToDkTeam(abbr){
+  const a = (abbr || '').toUpperCase();
+  return ESPN_TEAM_OVERRIDES[a] || a;
+}
+
+const vegasCache = {};
+async function fetchVegasLines(dateKey){
+  if(vegasCache[dateKey] !== undefined) return vegasCache[dateKey];
+  const proxy = getProxyUrl();
+  if(!proxy){ vegasCache[dateKey] = {}; return {}; }
+  try{
+    const ymd = dateKey.replace(/-/g, '');
+    const res = await fetch(proxy + '/espn/scoreboard?dates=' + ymd);
+    if(!res.ok) throw new Error('scoreboard HTTP ' + res.status);
+    const data = await res.json();
+    const totals = {};
+    (data.events || []).forEach(ev => {
+      const comp = ev.competitions && ev.competitions[0];
+      if(!comp) return;
+      const competitors = comp.competitors || [];
+      const odds = (comp.odds && comp.odds[0]) || null;
+      if(!odds || odds.overUnder == null) return;
+      const overUnder = Number(odds.overUnder);
+      let favTeam = null, margin = 0;
+      const detailsMatch = (odds.details || '').match(/([A-Z]{2,3})\s*-\s*([\d.]+)/);
+      if(detailsMatch){ favTeam = espnToDkTeam(detailsMatch[1]); margin = parseFloat(detailsMatch[2]); }
+      competitors.forEach(c => {
+        const abbr = espnToDkTeam(c.team && c.team.abbreviation);
+        if(!abbr) return;
+        let implied = overUnder / 2;
+        if(favTeam) implied += (abbr === favTeam ? margin / 2 : -margin / 2);
+        totals[abbr] = Math.round(implied * 10) / 10;
+      });
+    });
+    vegasCache[dateKey] = totals;
+    return totals;
+  } catch(err){
+    vegasCache[dateKey] = {};
+    return {};
+  }
+}
+
+// Real recent-form data from nflverse's public weekly player stats, used to
+// replace the crude salary-based projection fallback with actual production
+// over a player's last few games.
+function normalizePlayerName(name){
+  return (name || '').toLowerCase()
+    .replace(/[^a-z ]/g, '')
+    .replace(/\b(jr|sr|ii|iii|iv)\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+let historicalStatsCache = null;
+async function fetchHistoricalStats(){
+  if(historicalStatsCache) return historicalStatsCache;
+  const proxy = getProxyUrl();
+  if(!proxy || typeof Papa === 'undefined'){ historicalStatsCache = {}; return {}; }
+  try{
+    const season = new Date().getFullYear();
+    const res = await fetch(proxy + '/nflverse/player-stats?season=' + season);
+    if(!res.ok) throw new Error('nflverse HTTP ' + res.status);
+    const csvText = await res.text();
+    const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
+    const rows = parsed.data || [];
+
+    const byPlayer = {};
+    rows.forEach(r => {
+      const name = r.player_display_name || r.player_name;
+      const week = Number(r.week);
+      const pts = r.fantasy_points_ppr != null ? Number(r.fantasy_points_ppr) : Number(r.fantasy_points);
+      if(!name || isNaN(week) || isNaN(pts)) return;
+      const key = normalizePlayerName(name);
+      if(!byPlayer[key]) byPlayer[key] = [];
+      byPlayer[key].push({ week, pts });
+    });
+
+    const result = {};
+    Object.keys(byPlayer).forEach(key => {
+      const games = byPlayer[key].sort((a, b) => b.week - a.week).slice(0, 4); // last up to 4 games
+      if(!games.length) return;
+      const avg = games.reduce((s, g) => s + g.pts, 0) / games.length;
+      result[key] = Math.round(avg * 10) / 10;
+    });
+    historicalStatsCache = result;
+    return result;
+  } catch(err){
+    historicalStatsCache = {};
+    return {};
+  }
 }
 
 const ROSTER_FILL_ORDER = ['DST','TE','QB','RB','RB','WR','WR','WR','FLEX'];
@@ -589,9 +734,13 @@ function describeLineup(built){
   const stacks = Object.entries(stackMap).filter(([, n]) => n >= 2).map(([team]) => team);
   const flagged = built.roster.filter(r => r.player.injuryStatus && r.player.injuryStatus !== '');
   const windy = built.roster.filter(r => r.player.weather && r.player.weather.wind != null && r.player.weather.wind >= 15);
+  const highTotal = built.roster.filter(r => r.player.impliedTotal != null && r.player.impliedTotal >= 25 && r.slot !== 'DST');
+  const goodDstSpot = built.roster.filter(r => r.slot === 'DST' && r.player.oppImpliedTotal != null && r.player.oppImpliedTotal <= 19);
 
   const parts = [];
   if(stacks.length) parts.push('Stacks ' + stacks.join(', ') + ' pass-game pieces together.');
+  if(highTotal.length) parts.push('Leans into high implied totals: ' + Array.from(new Set(highTotal.map(r => r.player.team))).join(', ') + '.');
+  if(goodDstSpot.length) parts.push('DST faces a low implied opponent total.');
   if(flagged.length) parts.push('Includes injury-tagged players: ' + flagged.map(r => r.player.name + ' (' + r.player.injuryStatus + ')').join(', ') + '.');
   if(windy.length) parts.push('Wind ≥15mph expected for: ' + Array.from(new Set(windy.map(r => r.player.team))).join(', ') + '.');
   if(!parts.length) parts.push('Highest-projected valid roster under the salary cap with no flagged risk factors.');
@@ -970,7 +1119,7 @@ async function generateLineups(){
 
   generateBtn.disabled = true;
   generateBtn.textContent = 'Building lineups…';
-  resultsArea.innerHTML = '<div class="status">Applying injury/weather adjustments and optimizing…</div>';
+  resultsArea.innerHTML = '<div class="status">Applying injury/weather/Vegas adjustments and optimizing…</div>';
 
   try{
     const slate = slatesCache.find(s => String(s.draftGroupId) === String(activeDraftGroupId));
@@ -978,6 +1127,18 @@ async function generateLineups(){
 
     if(pool[0] && pool[0].homeTeam !== undefined){
       await enrichWithWeather(pool, dateKey);
+
+      const vegas = await fetchVegasLines(dateKey);
+      pool.forEach(p => {
+        p.impliedTotal = vegas[p.team] != null ? vegas[p.team] : null;
+        p.oppImpliedTotal = (p.opp && vegas[p.opp] != null) ? vegas[p.opp] : null;
+      });
+
+      const hist = await fetchHistoricalStats();
+      pool.forEach(p => {
+        const key = normalizePlayerName(p.name);
+        if(hist[key] != null) p.avgPts = hist[key]; // real recent form takes priority when we have it
+      });
     }
     computeProjections(pool);
 
