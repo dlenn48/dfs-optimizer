@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lineup Builder</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg: #101F19;
+    --panel: #16271F;
+    --panel-2: #1B2E24;
+    --line: #2B4636;
+    --chalk: #EDE8DC;
+    --muted: #93A79A;
+    --gold: #D9A94E;
+    --rust: #C1502E;
+    --turf: #4C7A5D;
+  }
+  *{ box-sizing: border-box; }
+  html,body{ margin:0; padding:0; }
+  body{
+    background: var(--bg);
+    color: var(--chalk);
+    font-family: 'IBM Plex Sans', sans-serif;
+    min-height: 100vh;
+  }
+  .display{ font-family: 'Big Shoulders Display', sans-serif; font-weight: 700; letter-spacing: 0.01em; }
+  .nums{ font-variant-numeric: tabular-nums; }
+
+  a, button, input, select, textarea{ font-family: inherit; }
+  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, [tabindex]:focus-visible{
+    outline: 2px solid var(--gold);
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce){
+    *{ transition: none !important; animation: none !important; }
+  }
+
+  .wrap{ max-width: 1180px; margin: 0 auto; padding: 20px 16px 60px; }
+
+  header.top{
+    display:flex; align-items:baseline; justify-content:space-between;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 14px; margin-bottom: 20px;
+    flex-wrap: wrap; gap: 10px;
+  }
+  header.top .title{ font-size: 30px; line-height: 1; }
+  header.top .sub{ color: var(--muted); font-size: 13px; margin-top: 4px; }
+
+  nav.tabs{ display:flex; gap: 4px; }
+  nav.tabs button{
+    background: transparent; border: 1px solid var(--line); color: var(--muted);
+    padding: 8px 16px; cursor: pointer; font-size: 14px; border-radius: 2px;
+  }
+  nav.tabs button.active{ color: var(--chalk); border-color: var(--gold); background: rgba(217,169,78,0.08); }
+
+  .layout{ display:grid; grid-template-columns: 340px 1fr; gap: 20px; align-items:start; }
+  @media (max-width: 780px){ .layout{ grid-template-columns: 1fr; } }
+
+  .panel{
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    padding: 18px;
+  }
+  .field{ margin-bottom: 14px; }
+  .field label{ display:block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .field input[type=text], .field input[type=number], .field select, .field textarea{
+    width: 100%; background: var(--panel-2); border: 1px solid var(--line); color: var(--chalk);
+    padding: 9px 10px; border-radius: 2px; font-size: 14px; resize: vertical;
+  }
+  .field textarea{ min-height: 110px; line-height: 1.4; }
+  .field.pool textarea{ min-height: 170px; font-family: 'IBM Plex Sans', monospace; font-size: 12.5px; }
+  .row2{ display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+  .btn{
+    display:inline-block; background: var(--gold); color: #1A1305; border: none;
+    padding: 11px 18px; font-size: 14px; font-weight: 600; border-radius: 2px; cursor: pointer; width: 100%;
+  }
+  .btn:disabled{ opacity: 0.5; cursor: default; }
+  .btn.ghost{ background: transparent; border: 1px solid var(--line); color: var(--chalk); width: auto; padding: 6px 12px; font-size: 12px; }
+
+  .status{ color: var(--muted); font-size: 14px; padding: 30px 6px; }
+  .status.error{ color: var(--rust); }
+
+  .empty{ color: var(--muted); font-size: 14px; padding: 40px 20px; text-align:center; border: 1px dashed var(--line); border-radius: 2px; }
+
+  .lineupCard{ background: var(--panel); border: 1px solid var(--line); border-radius: 2px; margin-bottom: 16px; }
+  .lineupCard .lcHead{
+    display:flex; justify-content:space-between; align-items:center;
+    padding: 12px 16px; border-bottom: 1px solid var(--line);
+  }
+  .lineupCard .lcHead .label{ font-size: 18px; }
+  .lineupCard .lcHead .stats{ display:flex; gap: 18px; }
+  .lineupCard .lcHead .stat{ text-align:right; }
+  .lineupCard .lcHead .stat .n{ font-size: 20px; color: var(--gold); }
+  .lineupCard .lcHead .stat .l{ font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+
+  table.roster{ width:100%; border-collapse: collapse; font-size: 13.5px; }
+  table.roster th{ text-align:left; color: var(--muted); font-weight:500; font-size: 11px; padding: 6px 16px; border-bottom: 1px solid var(--line); }
+  table.roster td{ padding: 7px 16px; border-bottom: 1px solid rgba(43,70,54,0.5); }
+  table.roster tr:last-child td{ border-bottom: none; }
+  table.roster td.slot{ color: var(--turf); font-weight: 600; width: 42px; }
+  table.roster td.sal, table.roster td.pts{ text-align:right; }
+
+  .reasoning{ padding: 12px 16px 16px; color: var(--muted); font-size: 13px; line-height: 1.5; border-top: 1px solid var(--line); }
+
+  .histItem{ border: 1px solid var(--line); border-radius: 2px; padding: 12px 16px; margin-bottom: 10px; cursor:pointer; }
+  .histItem:hover{ border-color: var(--gold); }
+  .histItem .hTop{ display:flex; justify-content:space-between; align-items:center; }
+  .histItem .hTitle{ font-size: 16px; }
+  .histItem .hMeta{ color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .histDetail{ margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <div class="title display">Lineup Builder</div>
+      <div class="sub">NFL DFS · Classic contests · QB / RB / RB / WR / WR / WR / TE / FLEX / DST</div>
+    </div>
+    <nav class="tabs">
+      <button id="tabGenBtn" class="active">Generate</button>
+      <button id="tabHistBtn">History</button>
+    </nav>
+  </header>
+
+  <section id="genView">
+    <div class="layout">
+      <div class="panel">
+        <div class="field">
+          <label for="apiKey">Anthropic API key <span style="color:var(--muted);">(only needed if this page is running outside Claude.ai, e.g. on GitHub Pages)</span></label>
+          <input type="password" id="apiKey" placeholder="sk-ant-…">
+          <div style="font-size:11px; color:var(--muted); margin-top:4px;">Stored only in this browser. Never leaves your device except in direct calls to Anthropic's API.</div>
+        </div>
+        <div class="field">
+          <label for="weekLabel">Slate label</label>
+          <input type="text" id="weekLabel" placeholder="e.g. Week 1 2026 — Sun Main">
+        </div>
+        <div class="row2">
+          <div class="field">
+            <label for="contestType">Contest type</label>
+            <select id="contestType">
+              <option value="cash">Cash / double-up</option>
+              <option value="small">Small-field (top-heavy)</option>
+              <option value="large" selected>Large-field GPP</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="salaryCap">Salary cap</label>
+            <input type="number" id="salaryCap" value="50000">
+          </div>
+        </div>
+        <div class="field">
+          <label for="numLineups">Number of variants</label>
+          <select id="numLineups">
+            <option value="3">3</option>
+            <option value="4" selected>4</option>
+            <option value="5">5</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="contestSelect">DraftKings contest</label>
+          <div style="display:flex; gap:8px; margin-bottom:8px;">
+            <button type="button" class="btn ghost" id="loadContestsBtn" style="width:auto;">Load NFL contests</button>
+            <input type="text" id="contestFilter" placeholder="Filter by name…" style="flex:1; display:none;">
+          </div>
+          <select id="contestSelect" style="display:none;"></select>
+          <div style="margin-top:8px;">
+            <button type="button" id="manualToggle" class="btn ghost" style="width:auto; font-size:11px;">Enter contest ID manually instead</button>
+          </div>
+          <div id="manualIdRow" style="display:none; margin-top:8px;">
+            <input type="text" id="contestId" placeholder="e.g. 194103908">
+          </div>
+          <div style="margin-top:8px;">
+            <button type="button" class="btn ghost" id="fetchPoolBtn" style="width:auto;">Fetch pool</button>
+          </div>
+          <div id="fetchStatus" style="font-size:12px; color:var(--muted); margin-top:6px;"></div>
+        </div>
+        <div class="field pool">
+          <label for="playerPool">Player pool</label>
+          <textarea id="playerPool" placeholder="Paste your DraftKings salary/player pool here — name, position, team, opponent, salary. A CSV export works, or a plain pasted list. Or use Fetch pool above."></textarea>
+        </div>
+        <div class="field">
+          <label for="context">Contest notes (optional)</label>
+          <textarea id="context" placeholder="Entries, payout structure, injuries you already know about, anything else worth factoring in."></textarea>
+        </div>
+        <button class="btn" id="generateBtn">Generate lineups</button>
+      </div>
+
+      <div id="resultsArea">
+        <div class="empty">Paste your player pool on the left and hit Generate. Claude will research current injuries, weather, and matchups before building lineups.</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="histView" style="display:none;">
+    <div id="histList"></div>
+    <div id="histDetail" class="histDetail"></div>
+  </section>
+</div>
+
+<script>
+const genView = document.getElementById('genView');
+const histView = document.getElementById('histView');
+const tabGenBtn = document.getElementById('tabGenBtn');
+const tabHistBtn = document.getElementById('tabHistBtn');
+const resultsArea = document.getElementById('resultsArea');
+const generateBtn = document.getElementById('generateBtn');
+
+// Works inside Claude.ai artifacts (window.storage) AND as a standalone
+// page e.g. on GitHub Pages (falls back to localStorage automatically).
+const hasArtifactStorage = typeof window.storage !== 'undefined';
+const store = {
+  async get(key){
+    if(hasArtifactStorage) return window.storage.get(key);
+    const raw = localStorage.getItem(key);
+    if(raw === null) throw new Error('not found');
+    return { key, value: raw };
+  },
+  async set(key, value){
+    if(hasArtifactStorage) return window.storage.set(key, value);
+    localStorage.setItem(key, value);
+    return { key, value };
+  },
+  async delete(key){
+    if(hasArtifactStorage) return window.storage.delete(key);
+    localStorage.removeItem(key);
+    return { key, deleted: true };
+  }
+};
+
+// Persist the API key locally (only relevant outside Claude.ai) so it
+// doesn't need retyping every visit.
+(function restoreApiKey(){
+  try{
+    const saved = localStorage.getItem('dfs-anthropic-key');
+    if(saved) document.getElementById('apiKey').value = saved;
+  } catch(e){}
+})();
+document.getElementById('apiKey').addEventListener('change', (e) => {
+  try{ localStorage.setItem('dfs-anthropic-key', e.target.value.trim()); } catch(err){}
+});
+
+function switchTab(tab){
+  if(tab === 'gen'){
+    genView.style.display = '';
+    histView.style.display = 'none';
+    tabGenBtn.classList.add('active');
+    tabHistBtn.classList.remove('active');
+  } else {
+    genView.style.display = 'none';
+    histView.style.display = '';
+    tabGenBtn.classList.remove('active');
+    tabHistBtn.classList.add('active');
+    loadHistoryList();
+  }
+}
+tabGenBtn.addEventListener('click', () => switchTab('gen'));
+tabHistBtn.addEventListener('click', () => switchTab('hist'));
+
+function slugify(s){
+  return (s || 'slate').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'slate';
+}
+
+function extractJson(text){
+  let t = text.trim();
+  t = t.replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
+  const start = t.indexOf('{');
+  const end = t.lastIndexOf('}');
+  if(start === -1 || end === -1) throw new Error('No JSON object found in response.');
+  return t.slice(start, end + 1);
+}
+
+function buildPrompt(fields){
+  return [
+    'You are an expert NFL DFS analyst building DraftKings Classic lineups.',
+    'Roster: QB, RB, RB, WR, WR, WR, TE, FLEX (RB/WR/TE), DST. Salary cap: $' + fields.salaryCap + '.',
+    'Contest type: ' + fields.contestType + ' (cash = prioritize floor/safety; small = balance floor and ceiling since only a couple spots pay; large = prioritize ceiling and differentiation).',
+    'Slate label: ' + fields.weekLabel,
+    '',
+    'Player pool (salaries, teams, positions as provided):',
+    fields.playerPool,
+    '',
+    fields.context ? ('Additional context from the user: ' + fields.context) : '',
+    '',
+    'Before finalizing, use web search to check: current injury/inactive designations for players in this pool, weather conditions for any outdoor stadiums involved, current Vegas lines/totals for the relevant games, and any notable historical head-to-head or matchup trends.',
+    '',
+    'Build ' + fields.numLineups + ' distinct, valid lineups, each within the salary cap, each meaningfully different from the others (different stacks, different players at key positions) so they diversify risk rather than repeating the same core.',
+    '',
+    'Respond with ONLY a raw JSON object as your final message, no markdown code fences, no commentary before or after, matching exactly this shape:',
+    '{"lineups":[{"label":"short variant name","totalSalary":00000,"totalProjPts":00.0,"players":[{"slot":"QB","name":"","team":"","opponent":"","salary":0000,"projPts":0.0}],"reasoning":"1-3 sentence summary of the build logic, key injury/weather factors, and stack rationale"}]}',
+    'Keep reasoning concise. Do not include anything outside the JSON in your final message.'
+  ].join('\n');
+}
+
+let contestsCache = [];
+
+function renderContestOptions(filterText){
+  const select = document.getElementById('contestSelect');
+  const f = (filterText || '').toLowerCase();
+  const filtered = f ? contestsCache.filter(c => c.name.toLowerCase().includes(f)) : contestsCache;
+  select.innerHTML = '';
+  filtered.slice(0, 300).forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = c.id;
+    opt.dataset.dg = c.dg || '';
+    opt.textContent = c.name + (c.fee != null ? ' — $' + c.fee : '') + (c.entries != null ? ' — ' + c.entries + ' entries' : '');
+    select.appendChild(opt);
+  });
+  if(!filtered.length){
+    const opt = document.createElement('option');
+    opt.textContent = 'No contests match that filter';
+    opt.disabled = true;
+    select.appendChild(opt);
+  }
+}
+
+async function loadContestList(){
+  const btn = document.getElementById('loadContestsBtn');
+  btn.disabled = true;
+  setFetchStatus('Loading NFL contest list from DraftKings…');
+  try{
+    const res = await fetch('https://www.draftkings.com/lobby/getcontests?sport=NFL');
+    if(!res.ok) throw new Error('Lobby request failed (HTTP ' + res.status + ').');
+    const data = await res.json();
+    const raw = data.Contests || data.contests || [];
+    if(!raw.length) throw new Error('DraftKings returned no NFL contests right now.');
+
+    contestsCache = raw.map(c => ({
+      id: c.id ?? c.Id ?? c.ContestId ?? c.a,
+      name: c.n ?? c.Name ?? c.ContestName ?? ('Contest ' + (c.id ?? c.Id)),
+      fee: c.a ?? c.EntryFee ?? c.Fee,
+      entries: c.m ?? c.MaxEntries ?? c.Entries,
+      dg: c.dg ?? c.DraftGroupId ?? c.draftGroupId
+    })).filter(c => c.id != null);
+
+    if(!contestsCache.length) throw new Error('Could not read contest IDs from the response — DraftKings may have changed this endpoint\'s shape.');
+
+    document.getElementById('contestSelect').style.display = '';
+    document.getElementById('contestFilter').style.display = '';
+    renderContestOptions('');
+    setFetchStatus('Loaded ' + contestsCache.length + ' NFL contests. Filter or pick one, then Fetch pool.');
+  } catch(err){
+    setFetchStatus('Could not load the contest list: ' + (err.message || err) + ' This is an unofficial endpoint — your browser may be blocking the cross-origin request (CORS). Try entering a contest ID manually instead.', true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+document.getElementById('loadContestsBtn').addEventListener('click', loadContestList);
+document.getElementById('contestFilter').addEventListener('input', (e) => renderContestOptions(e.target.value));
+
+document.getElementById('manualToggle').addEventListener('click', () => {
+  const row = document.getElementById('manualIdRow');
+  const showing = row.style.display !== 'none';
+  row.style.display = showing ? 'none' : '';
+  document.getElementById('manualToggle').textContent = showing ? 'Enter contest ID manually instead' : 'Use the dropdown instead';
+});
+
+function getSelectedContestId(){
+  const manualRow = document.getElementById('manualIdRow');
+  if(manualRow.style.display !== 'none'){
+    return document.getElementById('contestId').value.trim();
+  }
+  const select = document.getElementById('contestSelect');
+  return select.value ? select.value.trim() : '';
+}
+
+function setFetchStatus(msg, isError){
+  const el = document.getElementById('fetchStatus');
+  el.textContent = msg;
+  el.style.color = isError ? 'var(--rust)' : 'var(--muted)';
+}
+
+function normalizeDraftable(p){
+  const name = p.displayName || p.DisplayName ||
+    ((p.firstName || p.FirstName || '') + ' ' + (p.lastName || p.LastName || '')).trim() || 'Unknown';
+  const pos = p.position || p.Position ||
+    (p.rosterSlotId != null ? String(p.rosterSlotId) : '') || '';
+  const team = p.teamAbbreviation || p.TeamAbbreviation || '';
+  const opp = (p.competition && (p.competition.name || p.competition.Name)) ||
+    (p.draftAlerts && p.draftAlerts.opponent) || '';
+  const salary = p.salary || p.Salary || '';
+  return [name, pos, team, opp, salary].join(',');
+}
+
+async function fetchPoolFromDK(){
+  const contestId = getSelectedContestId();
+  const fetchBtn = document.getElementById('fetchPoolBtn');
+  if(!contestId){
+    setFetchStatus('Load the contest list and pick one, or enter a contest ID.', true);
+    return;
+  }
+
+  fetchBtn.disabled = true;
+  setFetchStatus('Fetching contest details…');
+
+  try{
+    const contestRes = await fetch('https://api.draftkings.com/contests/v1/contests/' + encodeURIComponent(contestId) + '?format=json');
+    if(!contestRes.ok) throw new Error('Contest lookup failed (HTTP ' + contestRes.status + ').');
+    const contestData = await contestRes.json();
+
+    const draftGroupId =
+      (contestData.contestDetail && contestData.contestDetail.draftGroupId) ||
+      contestData.draftGroupId ||
+      (contestData.ContestDetail && contestData.ContestDetail.DraftGroupId) ||
+      (Array.isArray(contestData.contestDetails) && contestData.contestDetails[0] && contestData.contestDetails[0].draftGroupId);
+
+    if(!draftGroupId) throw new Error('Could not find a draft group ID in the contest response — DraftKings may have changed this endpoint\'s shape.');
+
+    setFetchStatus('Fetching player pool for draft group ' + draftGroupId + '…');
+    const poolRes = await fetch('https://api.draftkings.com/draftgroups/v1/draftgroups/' + encodeURIComponent(draftGroupId) + '/draftables');
+    if(!poolRes.ok) throw new Error('Player pool lookup failed (HTTP ' + poolRes.status + ').');
+    const poolData = await poolRes.json();
+
+    const draftables = poolData.draftables || poolData.Draftables || [];
+    if(!draftables.length) throw new Error('No players came back for this draft group.');
+
+    const lines = draftables.map(normalizeDraftable);
+    document.getElementById('playerPool').value = 'Name,Position,Team,Opponent,Salary\n' + lines.join('\n');
+    setFetchStatus('Pulled ' + draftables.length + ' players directly from DraftKings. Review below, then Generate.');
+  } catch(err){
+    setFetchStatus('Auto-fetch failed: ' + (err.message || err) + ' This is an unofficial endpoint — your browser may be blocking the cross-origin request (CORS), or DraftKings may have changed it. Paste the pool manually instead.', true);
+  } finally {
+    fetchBtn.disabled = false;
+  }
+}
+document.getElementById('fetchPoolBtn').addEventListener('click', fetchPoolFromDK);
+
+async function generateLineups(){
+  const fields = {
+    weekLabel: document.getElementById('weekLabel').value.trim(),
+    contestType: document.getElementById('contestType').value,
+    salaryCap: document.getElementById('salaryCap').value.trim() || '50000',
+    numLineups: document.getElementById('numLineups').value,
+    playerPool: document.getElementById('playerPool').value.trim(),
+    context: document.getElementById('context').value.trim()
+  };
+
+  if(!fields.playerPool){
+    resultsArea.innerHTML = '<div class="status error">Paste a player pool before generating.</div>';
+    return;
+  }
+
+  generateBtn.disabled = true;
+  generateBtn.textContent = 'Researching and building…';
+  resultsArea.innerHTML = '<div class="status">Checking injuries, weather, and matchups, then building lineups…</div>';
+
+  try{
+    const apiKey = document.getElementById('apiKey').value.trim();
+    const headers = { 'Content-Type': 'application/json' };
+    if(apiKey){
+      headers['x-api-key'] = apiKey;
+      headers['anthropic-version'] = '2023-06-01';
+      headers['anthropic-dangerous-direct-browser-access'] = 'true';
+    }
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 1000,
+        messages: [{ role: 'user', content: buildPrompt(fields) }],
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }]
+      })
+    });
+
+    const data = await response.json();
+    if(data.error){ throw new Error(data.error.message || 'API error'); }
+
+    const textBlocks = (data.content || []).filter(b => b.type === 'text').map(b => b.text);
+    const finalText = textBlocks[textBlocks.length - 1] || '';
+    const parsed = JSON.parse(extractJson(finalText));
+
+    renderLineups(parsed.lineups || []);
+    await saveToHistory(fields, parsed.lineups || []);
+  } catch(err){
+    resultsArea.innerHTML = '<div class="status error">Something went wrong: ' + (err.message || err) + '</div>';
+  } finally {
+    generateBtn.disabled = false;
+    generateBtn.textContent = 'Generate lineups';
+  }
+}
+generateBtn.addEventListener('click', generateLineups);
+
+function lineupCardHtml(lu){
+  const rows = (lu.players || []).map(p => (
+    '<tr><td class="slot">' + (p.slot||'') + '</td>' +
+    '<td>' + (p.name||'') + (p.team ? ' <span style="color:var(--muted)">' + p.team + (p.opponent ? ' vs ' + p.opponent : '') + '</span>' : '') + '</td>' +
+    '<td class="sal nums">$' + Number(p.salary||0).toLocaleString() + '</td>' +
+    '<td class="pts nums">' + (p.projPts != null ? p.projPts : '') + '</td></tr>'
+  )).join('');
+
+  return (
+    '<div class="lineupCard">' +
+      '<div class="lcHead">' +
+        '<div class="label display">' + (lu.label || 'Variant') + '</div>' +
+        '<div class="stats">' +
+          '<div class="stat"><div class="n nums">$' + Number(lu.totalSalary||0).toLocaleString() + '</div><div class="l">Salary</div></div>' +
+          '<div class="stat"><div class="n nums">' + (lu.totalProjPts != null ? lu.totalProjPts : '—') + '</div><div class="l">Proj Pts</div></div>' +
+        '</div>' +
+      '</div>' +
+      '<table class="roster"><thead><tr><th>Slot</th><th>Player</th><th>Salary</th><th>Proj</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+      (lu.reasoning ? '<div class="reasoning">' + lu.reasoning + '</div>' : '') +
+    '</div>'
+  );
+}
+
+function renderLineups(lineups){
+  if(!lineups.length){
+    resultsArea.innerHTML = '<div class="status error">No lineups were returned. Try again.</div>';
+    return;
+  }
+  resultsArea.innerHTML = lineups.map(lineupCardHtml).join('');
+}
+
+async function saveToHistory(fields, lineups){
+  try{
+    const slug = slugify(fields.weekLabel) + '-' + Date.now();
+    const key = 'week:' + slug;
+    const entry = {
+      key: key,
+      weekLabel: fields.weekLabel || 'Untitled slate',
+      contestType: fields.contestType,
+      numLineups: lineups.length,
+      generatedAt: new Date().toISOString()
+    };
+
+    await store.set(key, JSON.stringify({ fields, lineups, generatedAt: entry.generatedAt }));
+
+    let index = [];
+    try{
+      const idx = await store.get('history-index');
+      if(idx && idx.value) index = JSON.parse(idx.value);
+    } catch(e){ index = []; }
+    index.unshift(entry);
+    await store.set('history-index', JSON.stringify(index));
+  } catch(e){
+    console.error('Could not save history', e);
+  }
+}
+
+async function loadHistoryList(){
+  const histList = document.getElementById('histList');
+  const histDetail = document.getElementById('histDetail');
+  histDetail.innerHTML = '';
+  histList.innerHTML = '<div class="status">Loading history…</div>';
+
+  let index = [];
+  try{
+    const idx = await store.get('history-index');
+    if(idx && idx.value) index = JSON.parse(idx.value);
+  } catch(e){ index = []; }
+
+  if(!index.length){
+    histList.innerHTML = '<div class="empty">No saved lineups yet. Generate a slate and it will show up here.</div>';
+    return;
+  }
+
+  histList.innerHTML = index.map((it, i) => (
+    '<div class="histItem" data-key="' + it.key + '" data-idx="' + i + '">' +
+      '<div class="hTop">' +
+        '<div class="hTitle display">' + it.weekLabel + '</div>' +
+        '<button class="btn ghost" data-remove="' + i + '">Remove</button>' +
+      '</div>' +
+      '<div class="hMeta">' + it.contestType + ' · ' + it.numLineups + ' lineups · ' + new Date(it.generatedAt).toLocaleString() + '</div>' +
+    '</div>'
+  )).join('');
+
+  histList.querySelectorAll('.histItem').forEach(el => {
+    el.addEventListener('click', async (e) => {
+      if(e.target.dataset.remove !== undefined) return;
+      const key = el.dataset.key;
+      try{
+        const res = await store.get(key);
+        const parsed = JSON.parse(res.value);
+        histDetail.innerHTML = '<div class="empty" style="text-align:left;margin-bottom:16px;">' +
+          (parsed.fields.weekLabel || '') + ' — ' + parsed.fields.contestType + '</div>' +
+          parsed.lineups.map(lineupCardHtml).join('');
+      } catch(err){
+        histDetail.innerHTML = '<div class="status error">Could not load this entry.</div>';
+      }
+    });
+  });
+
+  histList.querySelectorAll('[data-remove]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const i = Number(btn.dataset.remove);
+      const key = index[i].key;
+      try{
+        await store.delete(key);
+        index.splice(i, 1);
+        await store.set('history-index', JSON.stringify(index));
+        loadHistoryList();
+      } catch(err){
+        console.error('Could not remove entry', err);
+      }
+    });
+  });
+}
+</script>
+</body>
+</html>
