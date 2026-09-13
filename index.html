@@ -154,14 +154,12 @@
     <div class="layout">
       <div class="panel">
         <div class="field">
-          <label for="proxyUrl">Proxy URL <span style="color:var(--muted); font-weight:400;">(recommended — see setup notes)</span></label>
+          <label for="proxyUrl">Proxy URL <span style="color:var(--muted); font-weight:400;">(needed for the slate/pool data)</span></label>
           <input type="text" id="proxyUrl" placeholder="https://your-worker.your-subdomain.workers.dev">
-          <div style="font-size:11px; color:var(--muted); margin-top:4px;">Routes DraftKings + Claude calls through your own Cloudflare Worker, avoiding CORS blocks and keeping your API key off this page. Leave blank to fall back to direct calls (may fail from GitHub Pages) plus the manual key field below.</div>
+          <div style="font-size:11px; color:var(--muted); margin-top:4px;">Routes DraftKings calls through your own Cloudflare Worker, avoiding CORS blocks. Lineup generation itself now runs entirely in your browser — free, no API key needed.</div>
         </div>
         <div class="field">
-          <label for="apiKey">Anthropic API key <span style="color:var(--muted); font-weight:400;">(fallback only — skip this if you set a Proxy URL above)</span></label>
-          <input type="password" id="apiKey" placeholder="sk-ant-…">
-          <div style="font-size:11px; color:var(--muted); margin-top:4px;">Stored only in this browser. Never leaves your device except in direct calls to Anthropic's API.</div>
+          <input type="hidden" id="apiKey" value="">
         </div>
         <div class="field">
           <label for="weekLabel">Slate label</label>
@@ -302,39 +300,9 @@ function slugify(s){
   return (s || 'slate').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'slate';
 }
 
-function extractJson(text){
-  let t = text.trim();
-  t = t.replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
-  const start = t.indexOf('{');
-  const end = t.lastIndexOf('}');
-  if(start === -1 || end === -1) throw new Error('No JSON object found in response.');
-  return t.slice(start, end + 1);
-}
-
-function buildPrompt(fields){
-  return [
-    'You are an expert NFL DFS analyst building DraftKings Classic lineups.',
-    'Roster: QB, RB, RB, WR, WR, WR, TE, FLEX (RB/WR/TE), DST. Salary cap: $' + fields.salaryCap + '.',
-    'Contest type: ' + fields.contestType + ' (cash = prioritize floor/safety; small = balance floor and ceiling since only a couple spots pay; large = prioritize ceiling and differentiation).',
-    'Slate label: ' + fields.weekLabel,
-    '',
-    'Player pool (salaries, teams, positions as provided):',
-    fields.playerPool,
-    '',
-    fields.context ? ('Additional context from the user: ' + fields.context) : '',
-    '',
-    'Before finalizing, use web search to check: current injury/inactive designations for players in this pool, weather conditions for any outdoor stadiums involved, current Vegas lines/totals for the relevant games, and any notable historical head-to-head or matchup trends.',
-    '',
-    'Build ' + fields.numLineups + ' distinct, valid lineups, each within the salary cap, each meaningfully different from the others (different stacks, different players at key positions) so they diversify risk rather than repeating the same core.',
-    '',
-    'Respond with ONLY a raw JSON object as your final message, no markdown code fences, no commentary before or after, matching exactly this shape:',
-    '{"lineups":[{"label":"short variant name","totalSalary":00000,"totalProjPts":00.0,"players":[{"slot":"QB","name":"","team":"","opponent":"","salary":0000,"projPts":0.0}],"reasoning":"1-3 sentence summary of the build logic, key injury/weather factors, and stack rationale"}]}',
-    'Keep reasoning concise. Do not include anything outside the JSON in your final message.'
-  ].join('\n');
-}
-
 let contestsCache = [];
 let slatesCache = [];
+let currentPool = []; // structured players for the active slate, used by the optimizer
 
 function setFetchStatus(msg, isError){
   const el = document.getElementById('fetchStatus');
@@ -342,16 +310,222 @@ function setFetchStatus(msg, isError){
   el.style.color = isError ? 'var(--rust)' : 'var(--muted)';
 }
 
-function normalizeDraftable(p){
+// Team home stadium coordinates + roof type, used only to decide whether to
+// bother pulling a weather forecast at all. Domes/permanently-closed roofs
+// skip the weather call entirely.
+const STADIUMS = {
+  ARI:{lat:33.5276,lon:-112.2626,dome:true}, ATL:{lat:33.7554,lon:-84.4008,dome:true},
+  BAL:{lat:39.2780,lon:-76.6227,dome:false}, BUF:{lat:42.7738,lon:-78.7870,dome:false},
+  CAR:{lat:35.2258,lon:-80.8528,dome:false}, CHI:{lat:41.8623,lon:-87.6167,dome:false},
+  CIN:{lat:39.0955,lon:-84.5161,dome:false}, CLE:{lat:41.5061,lon:-81.6995,dome:false},
+  DAL:{lat:32.7473,lon:-97.0945,dome:true},  DEN:{lat:39.7439,lon:-105.0201,dome:false},
+  DET:{lat:42.3400,lon:-83.0456,dome:true},  GB:{lat:44.5013,lon:-88.0622,dome:false},
+  HOU:{lat:29.6847,lon:-95.4107,dome:true},  IND:{lat:39.7601,lon:-86.1639,dome:true},
+  JAX:{lat:30.3239,lon:-81.6373,dome:false}, KC:{lat:39.0489,lon:-94.4839,dome:false},
+  LAC:{lat:33.9535,lon:-118.3392,dome:false},LAR:{lat:33.9535,lon:-118.3392,dome:false},
+  LV:{lat:36.0909,lon:-115.1833,dome:true},  MIA:{lat:25.9580,lon:-80.2389,dome:false},
+  MIN:{lat:44.9738,lon:-93.2578,dome:true},  NE:{lat:42.0909,lon:-71.2643,dome:false},
+  NO:{lat:29.9509,lon:-90.0815,dome:true},   NYG:{lat:40.8135,lon:-74.0745,dome:false},
+  NYJ:{lat:40.8135,lon:-74.0745,dome:false}, PHI:{lat:39.9008,lon:-75.1675,dome:false},
+  PIT:{lat:40.4468,lon:-80.0158,dome:false}, SEA:{lat:47.5952,lon:-122.3316,dome:false},
+  SF:{lat:37.4032,lon:-121.9698,dome:false}, TB:{lat:27.9759,lon:-82.5033,dome:false},
+  TEN:{lat:36.1665,lon:-86.7713,dome:false}, WAS:{lat:38.9076,lon:-76.8645,dome:false}
+};
+
+function normalizePlayer(p){
   const name = p.displayName || p.DisplayName ||
     ((p.firstName || p.FirstName || '') + ' ' + (p.lastName || p.LastName || '')).trim() || 'Unknown';
-  const pos = p.position || p.Position ||
-    (p.rosterSlotId != null ? String(p.rosterSlotId) : '') || '';
-  const team = p.teamAbbreviation || p.TeamAbbreviation || '';
+  const pos = (p.position || p.Position || '').toUpperCase();
+  const team = (p.teamAbbreviation || p.TeamAbbreviation || '').toUpperCase();
   const opp = (p.competition && (p.competition.name || p.competition.Name)) ||
     (p.draftAlerts && p.draftAlerts.opponent) || '';
-  const salary = p.salary || p.Salary || '';
-  return [name, pos, team, opp, salary].join(',');
+  const salary = Number(p.salary || p.Salary || 0);
+  const injuryStatus = (p.injuryStatus || p.InjuryStatus || p.status || '').toUpperCase();
+
+  // Best-guess extraction of an embedded season-average points value —
+  // DraftKings' draftables payload sometimes includes this under
+  // draftStatAttributes; field/attribute names here are unconfirmed since
+  // the endpoint is undocumented.
+  let avgPts = null;
+  const attrs = p.draftStatAttributes || p.DraftStatAttributes || [];
+  if(Array.isArray(attrs)){
+    const hit = attrs.find(a => /fppg|avg|average/i.test(String(a.name || a.Name || a.id || '')));
+    if(hit && (hit.value != null || hit.Value != null)){
+      const v = parseFloat(hit.value ?? hit.Value);
+      if(!isNaN(v)) avgPts = v;
+    }
+  }
+
+  // Try to resolve which team is "home" from a competition string like
+  // "TB@CIN" (away@home is the standard sports convention).
+  let homeTeam = null;
+  const compName = (p.competition && (p.competition.name || p.competition.Name)) || '';
+  const m = compName.match(/([A-Z]{2,3})\s*@\s*([A-Z]{2,3})/);
+  if(m) homeTeam = m[2];
+
+  return {
+    id: p.playerId || p.PlayerId || p.draftableId || p.DraftableId || (name + team),
+    name, pos, team, opp, salary, injuryStatus, avgPts, homeTeam
+  };
+}
+
+function poolToCsv(pool){
+  return 'Name,Position,Team,Opponent,Salary,Injury\n' +
+    pool.map(p => [p.name, p.pos, p.team, p.opp, p.salary, p.injuryStatus].join(',')).join('\n');
+}
+
+// Rough salary-to-points baseline used only when no embedded projection is
+// available. This is a coarse industry rule-of-thumb, not a real model —
+// treat it as a floor, not a forecast.
+const SALARY_PPK = { QB: 2.7, RB: 2.4, WR: 2.4, TE: 2.1, DST: 2.2 };
+
+function baselineProjection(p){
+  if(p.avgPts != null) return p.avgPts;
+  const ppk = SALARY_PPK[p.pos] || 2.2;
+  return (p.salary / 1000) * ppk;
+}
+
+const weatherCache = {};
+async function fetchWeatherForTeam(team, dateKey){
+  const stadium = STADIUMS[team];
+  if(!stadium || stadium.dome) return null;
+  const cacheKey = team + '|' + dateKey;
+  if(weatherCache[cacheKey] !== undefined) return weatherCache[cacheKey];
+  try{
+    const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + stadium.lat + '&longitude=' + stadium.lon +
+      '&hourly=windspeed_10m,precipitation_probability&windspeed_unit=mph' +
+      '&start_date=' + dateKey + '&end_date=' + dateKey + '&timezone=America%2FNew_York';
+    const res = await fetch(url);
+    if(!res.ok) throw new Error('weather HTTP ' + res.status);
+    const data = await res.json();
+    const winds = (data.hourly && data.hourly.windspeed_10m) || [];
+    const precs = (data.hourly && data.hourly.precipitation_probability) || [];
+    // Use the midday-ish hours as a rough stand-in for game time since we
+    // don't reliably know exact kickoff hour per team here.
+    const wind = winds.length ? Math.max(...winds.slice(10, 20)) : null;
+    const precip = precs.length ? Math.max(...precs.slice(10, 20)) : null;
+    const result = { wind, precip };
+    weatherCache[cacheKey] = result;
+    return result;
+  } catch(err){
+    weatherCache[cacheKey] = null;
+    return null;
+  }
+}
+
+async function enrichWithWeather(pool, dateKey){
+  const homeTeams = Array.from(new Set(pool.map(p => p.homeTeam).filter(Boolean)));
+  const weatherByTeam = {};
+  await Promise.all(homeTeams.map(async team => {
+    weatherByTeam[team] = await fetchWeatherForTeam(team, dateKey);
+  }));
+  pool.forEach(p => { p.weather = p.homeTeam ? weatherByTeam[p.homeTeam] : null; });
+}
+
+function computeProjections(pool){
+  pool.forEach(p => {
+    let proj = baselineProjection(p);
+
+    // Coded injury discount (no AI — just DraftKings' own status tag).
+    if(p.injuryStatus === 'Q') proj *= 0.93;
+    else if(p.injuryStatus === 'D') proj *= 0.8;
+    else if(p.injuryStatus === 'O' || p.injuryStatus === 'OUT' || p.injuryStatus === 'IR') proj = 0;
+
+    // Coded weather adjustment for outdoor stadiums.
+    const w = p.weather;
+    if(w){
+      if(w.wind != null && w.wind >= 15 && ['QB','WR','TE'].includes(p.pos)) proj *= 0.9;
+      if(w.wind != null && w.wind >= 15 && p.pos === 'RB') proj *= 1.05;
+      if(w.precip != null && w.precip >= 50 && ['QB','WR','TE'].includes(p.pos)) proj *= 0.95;
+    }
+    p.proj = Math.round(proj * 10) / 10;
+  });
+}
+
+const ROSTER_FILL_ORDER = ['DST','TE','QB','RB','RB','WR','WR','WR','FLEX'];
+
+function eligibleForSlot(p, slot){
+  if(slot === 'FLEX') return ['RB','WR','TE'].includes(p.pos);
+  return p.pos === slot;
+}
+
+function buildLineup(pool, cap, excludeIds){
+  const available = pool.filter(p => !excludeIds.includes(p.id) && p.proj > 0 && p.salary > 0);
+  const used = new Set();
+  const roster = [];
+  let remainingCap = cap;
+
+  function cheapestFor(slot){
+    const c = available.filter(p => !used.has(p.id) && eligibleForSlot(p, slot));
+    return c.length ? Math.min(...c.map(p => p.salary)) : 0;
+  }
+
+  for(let i = 0; i < ROSTER_FILL_ORDER.length; i++){
+    const slot = ROSTER_FILL_ORDER[i];
+    const remaining = ROSTER_FILL_ORDER.slice(i + 1);
+    const reserve = remaining.reduce((sum, s) => sum + cheapestFor(s), 0);
+    const budget = remainingCap - reserve;
+
+    let candidates = available
+      .filter(p => !used.has(p.id) && eligibleForSlot(p, slot) && p.salary <= budget)
+      .sort((a, b) => b.proj - a.proj);
+
+    if(!candidates.length){
+      candidates = available
+        .filter(p => !used.has(p.id) && eligibleForSlot(p, slot))
+        .sort((a, b) => a.salary - b.salary);
+    }
+    if(!candidates.length) return null; // infeasible with this pool/exclusions
+
+    const pick = candidates[0];
+    roster.push({ slot, player: pick });
+    used.add(pick.id);
+    remainingCap -= pick.salary;
+  }
+
+  // Local-search improvement: swap in better players at the same slot while
+  // staying under the cap, until no swap helps.
+  let improved = true, iterations = 0;
+  while(improved && iterations < 200){
+    improved = false;
+    iterations++;
+    for(const entry of roster){
+      const budget = remainingCap + entry.player.salary;
+      const alt = available
+        .filter(p => !used.has(p.id) && eligibleForSlot(p, entry.slot) && p.salary <= budget && p.proj > entry.player.proj)
+        .sort((a, b) => b.proj - a.proj)[0];
+      if(alt){
+        used.delete(entry.player.id);
+        used.add(alt.id);
+        remainingCap += entry.player.salary - alt.salary;
+        entry.player = alt;
+        improved = true;
+      }
+    }
+  }
+
+  const totalSalary = roster.reduce((s, r) => s + r.player.salary, 0);
+  const totalProj = Math.round(roster.reduce((s, r) => s + r.player.proj, 0) * 10) / 10;
+  return { roster, totalSalary, totalProj };
+}
+
+function describeLineup(built){
+  const stackMap = {};
+  built.roster.forEach(r => {
+    if(['QB','WR','TE'].includes(r.slot === 'FLEX' ? r.player.pos : r.slot)){
+      stackMap[r.player.team] = (stackMap[r.player.team] || 0) + 1;
+    }
+  });
+  const stacks = Object.entries(stackMap).filter(([, n]) => n >= 2).map(([team]) => team);
+  const flagged = built.roster.filter(r => r.player.injuryStatus && r.player.injuryStatus !== '');
+  const windy = built.roster.filter(r => r.player.weather && r.player.weather.wind != null && r.player.weather.wind >= 15);
+
+  const parts = [];
+  if(stacks.length) parts.push('Stacks ' + stacks.join(', ') + ' pass-game pieces together.');
+  if(flagged.length) parts.push('Includes injury-tagged players: ' + flagged.map(r => r.player.name + ' (' + r.player.injuryStatus + ')').join(', ') + '.');
+  if(windy.length) parts.push('Wind ≥15mph expected for: ' + Array.from(new Set(windy.map(r => r.player.team))).join(', ') + '.');
+  if(!parts.length) parts.push('Highest-projected valid roster under the salary cap with no flagged risk factors.');
+  return parts.join(' ');
 }
 
 function formatDate(raw){
@@ -610,11 +784,12 @@ async function fetchPoolForDraftGroup(draftGroupId){
     const draftables = poolData.draftables || poolData.Draftables || [];
     if(!draftables.length) throw new Error('No players came back for this draft group.');
 
-    const lines = draftables.map(normalizeDraftable);
-    document.getElementById('playerPool').value = 'Name,Position,Team,Opponent,Salary\n' + lines.join('\n');
-    setFetchStatus('Pulled ' + draftables.length + ' players automatically. Review below, then Generate.');
+    currentPool = draftables.map(normalizePlayer);
+    document.getElementById('playerPool').value = poolToCsv(currentPool);
+    setFetchStatus('Pulled ' + currentPool.length + ' players automatically. Ready to generate.');
   } catch(err){
-    setFetchStatus('Could not auto-fetch this slate\'s pool: ' + (err.message || err) + ' Paste the pool manually as a fallback.', true);
+    currentPool = [];
+    setFetchStatus('Could not auto-fetch this slate\'s pool: ' + (err.message || err) + ' Paste the pool manually as a fallback (use the raw-pool toggle) — note manually pasted pools skip weather/injury enrichment.', true);
   }
 }
 
@@ -669,59 +844,63 @@ async function generateLineups(){
   const fields = {
     weekLabel: document.getElementById('weekLabel').value.trim(),
     contestType: document.getElementById('contestType').value,
-    salaryCap: document.getElementById('salaryCap').value.trim() || '50000',
-    numLineups: document.getElementById('numLineups').value,
-    playerPool: document.getElementById('playerPool').value.trim(),
-    context: document.getElementById('context').value.trim()
+    salaryCap: Number(document.getElementById('salaryCap').value) || 50000,
+    numLineups: 2
   };
 
-  if(!fields.playerPool){
-    resultsArea.innerHTML = '<div class="status error">Paste a player pool before generating.</div>';
+  const manualCsv = document.getElementById('playerPool').value.trim();
+  let pool = currentPool;
+  if((!pool || !pool.length) && manualCsv){
+    // Fallback: parse a manually pasted/edited CSV. No weather/injury enrichment
+    // is possible here since we don't have DraftKings' structured fields.
+    const rows = manualCsv.split('\n').slice(1).filter(Boolean);
+    pool = rows.map((row, i) => {
+      const [name, pos, team, opp, salary] = row.split(',');
+      return { id: 'manual-' + i, name, pos: (pos||'').toUpperCase(), team, opp, salary: Number(salary)||0, injuryStatus: '', avgPts: null, homeTeam: null };
+    });
+  }
+
+  if(!pool || !pool.length){
+    resultsArea.innerHTML = '<div class="status error">No player pool loaded — pick a slate above, or paste one into the raw pool box.</div>';
     return;
   }
 
   generateBtn.disabled = true;
-  generateBtn.textContent = 'Researching and building…';
-  resultsArea.innerHTML = '<div class="status">Checking injuries, weather, and matchups, then building lineups…</div>';
+  generateBtn.textContent = 'Building lineups…';
+  resultsArea.innerHTML = '<div class="status">Applying injury/weather adjustments and optimizing…</div>';
 
   try{
-    const proxy = getProxyUrl();
-    const apiKey = document.getElementById('apiKey').value.trim();
-    let endpoint, headers;
+    const slate = slatesCache.find(s => String(s.draftGroupId) === String(activeDraftGroupId));
+    const dateKey = (slate && slate.dateKey && slate.dateKey !== 'unknown') ? slate.dateKey : new Date().toISOString().slice(0,10);
 
-    if(proxy){
-      endpoint = proxy + '/anthropic';
-      headers = { 'Content-Type': 'application/json' };
-    } else {
-      endpoint = 'https://api.anthropic.com/v1/messages';
-      headers = { 'Content-Type': 'application/json' };
-      if(apiKey){
-        headers['x-api-key'] = apiKey;
-        headers['anthropic-version'] = '2023-06-01';
-        headers['anthropic-dangerous-direct-browser-access'] = 'true';
-      }
+    if(pool[0] && pool[0].homeTeam !== undefined){
+      await enrichWithWeather(pool, dateKey);
     }
+    computeProjections(pool);
 
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 1000,
-        messages: [{ role: 'user', content: buildPrompt(fields) }],
-        tools: [{ type: 'web_search_20250305', name: 'web_search' }]
-      })
-    });
+    const lineup1 = buildLineup(pool, fields.salaryCap, []);
+    if(!lineup1) throw new Error('Could not build a valid lineup from this pool — it may be missing a position DraftKings requires (QB/RB/WR/TE/DST).');
 
-    const data = await response.json();
-    if(data.error){ throw new Error(data.error.message || 'API error'); }
+    const lockOutIds = lineup1.roster
+      .slice()
+      .sort((a,b) => b.player.salary - a.player.salary)
+      .slice(0, 2)
+      .map(r => r.player.id);
+    const lineup2 = buildLineup(pool, fields.salaryCap, lockOutIds) || lineup1;
 
-    const textBlocks = (data.content || []).filter(b => b.type === 'text').map(b => b.text);
-    const finalText = textBlocks[textBlocks.length - 1] || '';
-    const parsed = JSON.parse(extractJson(finalText));
+    const lineups = [lineup1, lineup2].map((built, i) => ({
+      label: i === 0 ? 'Optimal' : 'Variant (differentiated)',
+      totalSalary: built.totalSalary,
+      totalProjPts: built.totalProj,
+      players: built.roster.map(r => ({
+        slot: r.slot, name: r.player.name, team: r.player.team, opponent: r.player.opp,
+        salary: r.player.salary, projPts: r.player.proj
+      })),
+      reasoning: describeLineup(built)
+    }));
 
-    renderLineups(parsed.lineups || []);
-    await saveToHistory(fields, parsed.lineups || []);
+    renderLineups(lineups);
+    await saveToHistory(fields, lineups);
   } catch(err){
     resultsArea.innerHTML = '<div class="status error">Something went wrong: ' + (err.message || err) + '</div>';
   } finally {
