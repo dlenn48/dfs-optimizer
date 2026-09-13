@@ -506,6 +506,59 @@ function buildLineup(pool, cap, excludeIds){
     }
   }
 
+  // Pairwise improvement: single-slot swaps above only replace one player
+  // with something strictly better at the same salary or less. That can get
+  // stuck maxing out the cap without ever finding a two-player combination
+  // that scores higher overall — sometimes by freeing salary from one slot
+  // to spend on another, sometimes by leaving a little unused entirely.
+  // Bounded to a top-N pool per slot so this stays fast in-browser.
+  const candidatesBySlot = {};
+  function topCandidatesFor(slot){
+    if(candidatesBySlot[slot]) return candidatesBySlot[slot];
+    const list = available.filter(p => eligibleForSlot(p, slot)).sort((a, b) => b.proj - a.proj).slice(0, 30);
+    candidatesBySlot[slot] = list;
+    return list;
+  }
+
+  let pairImproved = true, pairIterations = 0;
+  while(pairImproved && pairIterations < 50){
+    pairImproved = false;
+    pairIterations++;
+    for(let i = 0; i < roster.length; i++){
+      for(let j = i + 1; j < roster.length; j++){
+        const a = roster[i], b = roster[j];
+        const freedBudget = remainingCap + a.player.salary + b.player.salary;
+        const currentCombined = a.player.proj + b.player.proj;
+        let best = null;
+
+        for(const pa of topCandidatesFor(a.slot)){
+          if(used.has(pa.id) && pa.id !== a.player.id && pa.id !== b.player.id) continue;
+          for(const pb of topCandidatesFor(b.slot)){
+            if(pb.id === pa.id) continue;
+            if(used.has(pb.id) && pb.id !== a.player.id && pb.id !== b.player.id) continue;
+            const combinedSalary = pa.salary + pb.salary;
+            if(combinedSalary > freedBudget) continue;
+            const combinedProj = pa.proj + pb.proj;
+            if(combinedProj > currentCombined + 0.01 && (!best || combinedProj > best.combinedProj)){
+              best = { pa, pb, combinedProj };
+            }
+          }
+        }
+
+        if(best){
+          used.delete(a.player.id);
+          used.delete(b.player.id);
+          used.add(best.pa.id);
+          used.add(best.pb.id);
+          remainingCap = freedBudget - best.pa.salary - best.pb.salary;
+          roster[i] = { slot: a.slot, player: best.pa };
+          roster[j] = { slot: b.slot, player: best.pb };
+          pairImproved = true;
+        }
+      }
+    }
+  }
+
   const totalSalary = roster.reduce((s, r) => s + r.player.salary, 0);
   const totalProj = Math.round(roster.reduce((s, r) => s + r.player.proj, 0) * 10) / 10;
   return { roster, totalSalary, totalProj };
