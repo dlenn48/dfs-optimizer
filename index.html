@@ -323,7 +323,8 @@ const endpointStatus = {
   dkPool: { label: 'DK Player Pool', state: 'idle', detail: 'Pick a slate to fetch.' },
   vegas: { label: 'Vegas Lines (Odds API)', state: 'idle', detail: 'Runs during Generate.' },
   historical: { label: 'Historical Stats (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
-  weather: { label: 'Weather (Open-Meteo)', state: 'idle', detail: 'Runs during Generate.' }
+  weather: { label: 'Weather (Open-Meteo)', state: 'idle', detail: 'Runs during Generate.' },
+  defense: { label: 'Defense Matchups (nflverse)', state: 'idle', detail: 'Runs during Generate.' }
 };
 
 function setEndpointStatus(key, state, detail){
@@ -610,6 +611,14 @@ function computeProjections(pool){
       proj *= gameScriptFactor(p.pos, p.spread);
     }
 
+    // Real defense-vs-pass / defense-vs-rush adjustment, computed from
+    // nflverse's per-game opponent data (see fetchDefenseMatchups).
+    if(p.pos === 'QB' || p.pos === 'WR' || p.pos === 'TE'){
+      if(p.oppDefense && p.oppDefense.passFactor != null) proj *= p.oppDefense.passFactor;
+    } else if(p.pos === 'RB'){
+      if(p.oppDefense && p.oppDefense.rushFactor != null) proj *= p.oppDefense.rushFactor;
+    }
+
     p.proj = Math.round(proj * 10) / 10;
   });
 }
@@ -764,6 +773,71 @@ async function fetchHistoricalStats(){
   } catch(err){
     historicalStatsCache = {};
     setEndpointStatus('historical', 'error', String(err.message || err));
+    return {};
+  }
+}
+
+// Real defense-vs-pass and defense-vs-rush splits, computed from nflverse's
+// per-game team stats (which include an opponent_team column). Whatever an
+// offense produced in a given game is exactly what that game's opponent
+// allowed — aggregating by opponent_team turns per-team offensive rows into
+// genuine defense-allowed numbers. Not full position-by-position granularity
+// (no separate "vs. WR" vs. "vs. RB" split within the passing game), but a
+// real step past a single team-wide Vegas total.
+let defenseMatchupCache = null;
+async function fetchDefenseMatchups(){
+  if(defenseMatchupCache) return defenseMatchupCache;
+  const proxy = getProxyUrl();
+  if(!proxy){ defenseMatchupCache = {}; setEndpointStatus('defense', 'skipped', 'No Proxy URL set.'); return {}; }
+  if(typeof Papa === 'undefined'){ defenseMatchupCache = {}; setEndpointStatus('defense', 'error', 'CSV parser (PapaParse) failed to load.'); return {}; }
+  setEndpointStatus('defense', 'pending', 'Fetching defense matchup data…');
+  try{
+    const season = new Date().getFullYear();
+    const res = await fetch(proxy + '/nflverse/team-week?season=' + season);
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const csvText = await res.text();
+    const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
+    const rows = parsed.data || [];
+    if(!rows.length) throw new Error('CSV came back empty.');
+
+    const allowed = {}; // team -> { games, passYds, rushYds }
+    rows.forEach(r => {
+      const defense = r.opponent_team;
+      const passYds = Number(r.passing_yards);
+      const rushYds = Number(r.rushing_yards);
+      if(!defense || isNaN(passYds) || isNaN(rushYds)) return;
+      if(!allowed[defense]) allowed[defense] = { games: 0, passYds: 0, rushYds: 0 };
+      allowed[defense].games++;
+      allowed[defense].passYds += passYds;
+      allowed[defense].rushYds += rushYds;
+    });
+
+    const teams = Object.keys(allowed);
+    if(!teams.length) throw new Error('No defense rows found.');
+
+    const perGame = teams.map(t => ({
+      team: t,
+      passPerGame: allowed[t].passYds / allowed[t].games,
+      rushPerGame: allowed[t].rushYds / allowed[t].games
+    }));
+    const leagueAvgPass = perGame.reduce((s, t) => s + t.passPerGame, 0) / perGame.length;
+    const leagueAvgRush = perGame.reduce((s, t) => s + t.rushPerGame, 0) / perGame.length;
+
+    function clamp(f){ return Math.max(0.88, Math.min(1.12, f)); }
+    const result = {};
+    perGame.forEach(t => {
+      result[t.team] = {
+        passFactor: clamp(t.passPerGame / leagueAvgPass),
+        rushFactor: clamp(t.rushPerGame / leagueAvgRush)
+      };
+    });
+
+    defenseMatchupCache = result;
+    setEndpointStatus('defense', 'ok', 'Computed pass/rush defense splits for ' + teams.length + ' teams.');
+    return result;
+  } catch(err){
+    defenseMatchupCache = {};
+    setEndpointStatus('defense', 'error', String(err.message || err));
     return {};
   }
 }
@@ -933,11 +1007,27 @@ function describeLineup(built){
   const windy = built.roster.filter(r => r.player.weather && r.player.weather.wind != null && r.player.weather.wind >= 15);
   const highTotal = built.roster.filter(r => r.player.impliedTotal != null && r.player.impliedTotal >= 25 && r.slot !== 'DST');
   const goodDstSpot = built.roster.filter(r => r.slot === 'DST' && r.player.oppImpliedTotal != null && r.player.oppImpliedTotal <= 19);
+  const toughMatchups = built.roster.filter(r => {
+    const d = r.player.oppDefense;
+    if(!d) return false;
+    if(['QB','WR','TE'].includes(r.player.pos)) return d.passFactor != null && d.passFactor <= 0.92;
+    if(r.player.pos === 'RB') return d.rushFactor != null && d.rushFactor <= 0.92;
+    return false;
+  });
+  const easyMatchups = built.roster.filter(r => {
+    const d = r.player.oppDefense;
+    if(!d) return false;
+    if(['QB','WR','TE'].includes(r.player.pos)) return d.passFactor != null && d.passFactor >= 1.08;
+    if(r.player.pos === 'RB') return d.rushFactor != null && d.rushFactor >= 1.08;
+    return false;
+  });
 
   const parts = [];
   if(stacks.length) parts.push('Stacks ' + stacks.join(', ') + ' pass-game pieces together.');
   if(highTotal.length) parts.push('Leans into high implied totals: ' + Array.from(new Set(highTotal.map(r => r.player.team))).join(', ') + '.');
   if(goodDstSpot.length) parts.push('DST faces a low implied opponent total.');
+  if(easyMatchups.length) parts.push('Favorable matchups vs. weaker defenses: ' + easyMatchups.map(r => r.player.name).join(', ') + '.');
+  if(toughMatchups.length) parts.push('Tougher matchups worth a second look: ' + toughMatchups.map(r => r.player.name).join(', ') + '.');
   if(flagged.length) parts.push('Includes injury-tagged players: ' + flagged.map(r => r.player.name + ' (' + r.player.injuryStatus + ')').join(', ') + '.');
   if(windy.length) parts.push('Wind ≥15mph expected for: ' + Array.from(new Set(windy.map(r => r.player.team))).join(', ') + '.');
   if(!parts.length) parts.push('Highest-projected valid roster under the salary cap with no flagged risk factors.');
@@ -1342,6 +1432,11 @@ async function generateLineups(){
       pool.forEach(p => {
         const key = normalizePlayerName(p.name);
         if(hist[key] != null) p.avgPts = hist[key]; // real recent form takes priority when we have it
+      });
+
+      const defenseMatchups = await fetchDefenseMatchups();
+      pool.forEach(p => {
+        p.oppDefense = (p.opp && defenseMatchups[p.opp]) ? defenseMatchups[p.opp] : null;
       });
     }
     computeProjections(pool);
