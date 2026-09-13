@@ -677,7 +677,7 @@ async function fetchVegasLines(dateKey){
   if(!proxy){ vegasCache[dateKey] = { totals: {}, spreads: {} }; setEndpointStatus('vegas', 'skipped', 'No Proxy URL set.'); return vegasCache[dateKey]; }
   setEndpointStatus('vegas', 'pending', 'Fetching Vegas lines…');
   try{
-    const res = await fetch(proxy + '/oddsapi/nfl');
+    const res = await fetch(proxy + '/oddsapi/nfl', { cache: 'no-store' });
     if(!res.ok) throw new Error('odds API HTTP ' + res.status);
     const games = await res.json();
     if(!Array.isArray(games)) throw new Error(games && games.error ? games.error : 'Unexpected response shape.');
@@ -762,7 +762,7 @@ function regressedAvgPoints(r, games, rawPts){
 // on failure (distinct from {} = fetched fine but nothing usable).
 async function fetchSeasonStatsRaw(proxy, season){
   try{
-    const res = await fetch(proxy + '/nflverse/player-stats?season=' + season);
+    const res = await fetch(proxy + '/nflverse/player-stats?season=' + season, { cache: 'no-store' });
     if(!res.ok) throw new Error('HTTP ' + res.status);
     const csvText = await res.text();
     const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
@@ -788,7 +788,7 @@ async function fetchSeasonStatsRaw(proxy, season){
 // null on any failure so callers fall back to the season-total approach.
 async function fetchWeeklyPlayerStats(proxy, season, lastNWeeks){
   try{
-    const res = await fetch(proxy + '/nflverse/player-week?season=' + season);
+    const res = await fetch(proxy + '/nflverse/player-week?season=' + season, { cache: 'no-store' });
     if(!res.ok) throw new Error('HTTP ' + res.status);
     const csvText = await res.text();
     const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
@@ -891,7 +891,7 @@ async function fetchDefenseMatchups(){
   setEndpointStatus('defense', 'pending', 'Fetching defense matchup data…');
   try{
     const season = new Date().getFullYear();
-    const res = await fetch(proxy + '/nflverse/team-week?season=' + season);
+    const res = await fetch(proxy + '/nflverse/team-week?season=' + season, { cache: 'no-store' });
     if(!res.ok) throw new Error('HTTP ' + res.status);
     const csvText = await res.text();
     const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
@@ -976,7 +976,7 @@ async function fetchInjuryPracticeData(){
   setEndpointStatus('injuries', 'pending', 'Fetching practice reports…');
   try{
     const season = new Date().getFullYear();
-    const res = await fetch(proxy + '/nflverse/injuries?season=' + season);
+    const res = await fetch(proxy + '/nflverse/injuries?season=' + season, { cache: 'no-store' });
     if(!res.ok) throw new Error('HTTP ' + res.status);
     const csvText = await res.text();
     const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
@@ -1023,11 +1023,13 @@ async function fetchQbDepthChart(){
   setEndpointStatus('depthChart', 'pending', 'Fetching QB depth chart…');
   try{
     const season = new Date().getFullYear();
-    const res = await fetch(proxy + '/nflverse/depth-charts?season=' + season);
+    const res = await fetch(proxy + '/nflverse/depth-charts?season=' + season, { cache: 'no-store' });
     if(!res.ok) throw new Error('HTTP ' + res.status);
     const csvText = await res.text();
+    console.log('[QB Depth Chart] raw response length (chars):', csvText.length, '| first 120 chars:', JSON.stringify(csvText.slice(0, 120)));
     const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
     const rows = parsed.data || [];
+    console.log('[QB Depth Chart] Papa.parse row count:', rows.length, '| parse errors:', JSON.stringify((parsed.errors || []).slice(0, 5)));
     if(!rows.length) throw new Error('CSV came back empty (or had no QB rows).');
 
     // Multiple daily snapshots exist — keep only the most recent one.
@@ -1063,7 +1065,7 @@ async function fetchSnapCountTrends(){
   setEndpointStatus('snaps', 'pending', 'Fetching snap count trends…');
   try{
     const season = new Date().getFullYear();
-    const res = await fetch(proxy + '/nflverse/snap-counts?season=' + season);
+    const res = await fetch(proxy + '/nflverse/snap-counts?season=' + season, { cache: 'no-store' });
     if(!res.ok) throw new Error('HTTP ' + res.status);
     const csvText = await res.text();
     const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
