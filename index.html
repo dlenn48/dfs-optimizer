@@ -579,40 +579,42 @@ function deriveSlates(data, contests){
   const rawGroups = data.DraftGroups || data.draftGroups || [];
   let slates;
   if(rawGroups.length){
-    const byId = new Map();
-    const seenVisual = new Set();
+    const groups = new Map(); // visualKey -> slate, with all sibling IDs kept as candidates
     rawGroups.forEach(g => {
       const draftGroupId = g.DraftGroupId ?? g.draftGroupId ?? g.Id;
-      if(draftGroupId == null || byId.has(draftGroupId)) return;
+      if(draftGroupId == null) return;
       const games = g.Games || g.games || [];
       const gameCount = games.length || g.GameCount || g.gameCount || null;
       const startTime = g.StartDateEst ?? g.startDate ?? g.StartDate ?? g.ContestStartTime ?? g.startTime ?? null;
       const tag = g.DraftGroupTag || g.ContestStartTimeSuffix || g.Description || '';
       const kind = gameCount === 1 ? 'showdown' : (gameCount > 1 ? 'classic' : 'unknown');
-      // Collapse rows that would look identical in the picker (same tag, game
-      // count, start time, and type) even if DraftKings gave them distinct
-      // IDs — likely separate contest formats or eligibility variants that
-      // share the same underlying player pool, so showing them all is noise.
+      // Rows that look identical in the picker (same tag, game count, start
+      // time, type) often turn out to be distinct DraftKings products sharing
+      // the same games — e.g. a real Classic salary-cap slate vs. a Pick6/
+      // Best Ball-style pool with no salaries or DST. Keep every candidate ID
+      // under one visible row so a bad first pick can fall through to the
+      // next automatically instead of silently failing.
       const visualKey = tag + '|' + gameCount + '|' + startTime + '|' + kind;
-      if(seenVisual.has(visualKey)) return;
-      seenVisual.add(visualKey);
-      byId.set(draftGroupId, {
-        draftGroupId,
-        startTime,
-        gameCount,
-        tag,
-        matchup: gameCount === 1 ? extractMatchup(games[0]) : null,
-        kind
-      });
+      if(groups.has(visualKey)){
+        groups.get(visualKey).candidateIds.push(draftGroupId);
+      } else {
+        groups.set(visualKey, {
+          draftGroupId, // primary/display id
+          candidateIds: [draftGroupId],
+          startTime, gameCount, tag,
+          matchup: gameCount === 1 ? extractMatchup(games[0]) : null,
+          kind
+        });
+      }
     });
-    slates = Array.from(byId.values());
+    slates = Array.from(groups.values());
   } else {
     // Fallback: dedupe from contests. Game count/type usually isn't available
     // per contest in this shape, so these land in an "unknown" bucket.
     const seen = new Map();
     contests.forEach(c => {
       if(c.dg == null || seen.has(c.dg)) return;
-      seen.set(c.dg, { draftGroupId: c.dg, startTime: c.startTime || null, gameCount: null, tag: '', matchup: null, kind: 'unknown' });
+      seen.set(c.dg, { draftGroupId: c.dg, candidateIds: [c.dg], startTime: c.startTime || null, gameCount: null, tag: '', matchup: null, kind: 'unknown' });
     });
     slates = Array.from(seen.values());
   }
@@ -772,39 +774,58 @@ async function loadSlatesAndContests(){
   }
 }
 
-async function fetchPoolForDraftGroup(draftGroupId){
-  if(!draftGroupId) return;
-  setFetchStatus('Fetching player pool for draft group ' + draftGroupId + '…');
-  try{
-    const proxy = getProxyUrl();
-    const url = proxy
-      ? proxy + '/dk/draftgroup/' + encodeURIComponent(draftGroupId)
-      : 'https://api.draftkings.com/draftgroups/v1/draftgroups/' + encodeURIComponent(draftGroupId) + '/draftables';
-    const poolRes = await fetch(url);
-    if(!poolRes.ok) throw new Error('Player pool lookup failed (HTTP ' + poolRes.status + ').');
-    const poolData = await poolRes.json();
-    const draftables = poolData.draftables || poolData.Draftables || [];
-    if(!draftables.length) throw new Error('No players came back for this draft group.');
+async function fetchPoolForDraftGroup(candidateIds){
+  const ids = Array.isArray(candidateIds) ? candidateIds.filter(Boolean) : [candidateIds].filter(Boolean);
+  if(!ids.length) return;
 
-    currentPool = draftables.map(normalizePlayer);
-    document.getElementById('playerPool').value = poolToCsv(currentPool);
+  let lastErr = null;
+  for(let i = 0; i < ids.length; i++){
+    const id = ids[i];
+    const suffix = ids.length > 1 ? ' (option ' + (i + 1) + ' of ' + ids.length + ')' : '';
+    setFetchStatus('Fetching player pool for draft group ' + id + suffix + '…');
+    try{
+      const proxy = getProxyUrl();
+      const url = proxy
+        ? proxy + '/dk/draftgroup/' + encodeURIComponent(id)
+        : 'https://api.draftkings.com/draftgroups/v1/draftgroups/' + encodeURIComponent(id) + '/draftables';
+      const poolRes = await fetch(url);
+      if(!poolRes.ok) throw new Error('Player pool lookup failed (HTTP ' + poolRes.status + ').');
+      const poolData = await poolRes.json();
+      const draftables = poolData.draftables || poolData.Draftables || [];
+      if(!draftables.length) throw new Error('No players came back for this draft group.');
 
-    const hasSalaries = currentPool.some(p => p.salary > 0);
-    const hasDst = currentPool.some(p => p.pos === 'DST');
-    if(!hasSalaries || !hasDst){
-      setFetchStatus(
-        'Pulled ' + currentPool.length + ' players, but this draft group is missing ' +
-        (!hasSalaries ? 'salary data' : '') + (!hasSalaries && !hasDst ? ' and ' : '') + (!hasDst ? 'a DST/defense position' : '') +
-        ' — this is likely not a standard $50k Classic slate (could be Best Ball, Pick\u2019em, or a similar format). Try a different row in the Slate table instead, e.g. one tagged "(Sun-Mon)" or "(Touchdowns)".',
-        true
+      const pool = draftables.map(normalizePlayer);
+      const hasSalaries = pool.some(p => p.salary > 0);
+      const hasDst = pool.some(p => p.pos === 'DST');
+
+      if(hasSalaries && hasDst){
+        currentPool = pool;
+        document.getElementById('playerPool').value = poolToCsv(currentPool);
+        setFetchStatus(
+          'Pulled ' + currentPool.length + ' players automatically' +
+          (i > 0 ? ' (the first option for this slate wasn\'t a standard Classic pool, so this used alternate draft group ' + id + ')' : '') +
+          '. Ready to generate.'
+        );
+        return;
+      }
+      // Not a standard salary-cap Classic pool (e.g. Pick6/Best Ball) — try the next candidate, if any.
+      lastErr = new Error(
+        'draft group ' + id + ' has ' + pool.length + ' players but is missing ' +
+        (!hasSalaries ? 'salary data' : '') + (!hasSalaries && !hasDst ? ' and ' : '') + (!hasDst ? 'a DST position' : '') +
+        ' — likely not a Classic salary-cap slate.'
       );
-      return;
+    } catch(err){
+      lastErr = err;
     }
-    setFetchStatus('Pulled ' + currentPool.length + ' players automatically. Ready to generate.');
-  } catch(err){
-    currentPool = [];
-    setFetchStatus('Could not auto-fetch this slate\'s pool: ' + (err.message || err) + ' Paste the pool manually as a fallback (use the raw-pool toggle) — note manually pasted pools skip weather/injury enrichment.', true);
   }
+
+  currentPool = [];
+  setFetchStatus(
+    'Tried ' + ids.length + ' draft group option' + (ids.length > 1 ? 's' : '') + ' for this slate and none had standard salary-cap + DST data' +
+    (lastErr ? ' (last issue: ' + (lastErr.message || lastErr) + ')' : '') +
+    '. Try a different row in the Slate table, or use "Enter draft group ID manually".',
+    true
+  );
 }
 
 async function onSlateChange(draftGroupId){
@@ -816,7 +837,7 @@ async function onSlateChange(draftGroupId){
   }
   renderSlateTable();
   renderContestOptionsForSlate(draftGroupId);
-  await fetchPoolForDraftGroup(draftGroupId);
+  await fetchPoolForDraftGroup(slate ? slate.candidateIds : [draftGroupId]);
 }
 document.getElementById('refreshSlatesBtn').addEventListener('click', loadSlatesAndContests);
 document.getElementById('poolToggle').addEventListener('click', () => {
@@ -915,14 +936,18 @@ async function generateLineups(){
       .map(r => r.player.id);
     const lineup2 = buildLineup(pool, fields.salaryCap, lockOutIds) || lineup1;
 
+    const DISPLAY_ORDER = ['QB','RB','WR','TE','FLEX','DST'];
     const lineups = [lineup1, lineup2].map((built, i) => ({
       label: i === 0 ? 'Optimal' : 'Variant (differentiated)',
       totalSalary: built.totalSalary,
       totalProjPts: built.totalProj,
-      players: built.roster.map(r => ({
-        slot: r.slot, name: r.player.name, team: r.player.team, opponent: r.player.opp,
-        salary: r.player.salary, projPts: r.player.proj
-      })),
+      players: built.roster
+        .slice()
+        .sort((a, b) => DISPLAY_ORDER.indexOf(a.slot) - DISPLAY_ORDER.indexOf(b.slot))
+        .map(r => ({
+          slot: r.slot, name: r.player.name, team: r.player.team, opponent: r.player.opp,
+          salary: r.player.salary, projPts: r.player.proj
+        })),
       reasoning: describeLineup(built)
     }));
 
