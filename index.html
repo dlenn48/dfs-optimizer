@@ -207,21 +207,14 @@
             <div style="font-size:11px; color:var(--muted); margin-top:4px;">Set automatically from the slate — DraftKings NFL is always $50,000.</div>
           </div>
         </div>
-        <div class="field">
-          <label for="numLineups">Number of variants</label>
-          <select id="numLineups">
-            <option value="3">3</option>
-            <option value="4" selected>4</option>
-            <option value="5">5</option>
-          </select>
+        <input type="hidden" id="numLineups" value="2">
+        <input type="hidden" id="context" value="">
+        <div style="margin-bottom:14px;">
+          <button type="button" id="poolToggle" class="btn ghost" style="font-size:11px;">Show/edit raw player pool</button>
         </div>
-        <div class="field pool">
+        <div id="poolRow" class="field pool" style="display:none;">
           <label for="playerPool">Player pool <span style="color:var(--muted); font-weight:400;">(fills automatically once you pick a slate)</span></label>
           <textarea id="playerPool" placeholder="Pick a slate above and this fills automatically. You can still paste/edit manually if needed."></textarea>
-        </div>
-        <div class="field">
-          <label for="context">Contest notes (optional)</label>
-          <textarea id="context" placeholder="Entries, payout structure, injuries you already know about, anything else worth factoring in."></textarea>
         </div>
         <button class="btn" id="generateBtn">Generate lineups</button>
       </div>
@@ -410,18 +403,22 @@ function deriveSlates(data, contests){
   const rawGroups = data.DraftGroups || data.draftGroups || [];
   let slates;
   if(rawGroups.length){
-    slates = rawGroups.map(g => {
+    const byId = new Map();
+    rawGroups.forEach(g => {
+      const draftGroupId = g.DraftGroupId ?? g.draftGroupId ?? g.Id;
+      if(draftGroupId == null || byId.has(draftGroupId)) return; // dedupe repeated entries for the same slate
       const games = g.Games || g.games || [];
       const gameCount = games.length || g.GameCount || g.gameCount || null;
-      return {
-        draftGroupId: g.DraftGroupId ?? g.draftGroupId ?? g.Id,
+      byId.set(draftGroupId, {
+        draftGroupId,
         startTime: g.StartDateEst ?? g.startDate ?? g.StartDate ?? g.ContestStartTime ?? g.startTime ?? null,
         gameCount: gameCount,
         tag: g.DraftGroupTag || g.ContestStartTimeSuffix || g.Description || '',
         matchup: gameCount === 1 ? extractMatchup(games[0]) : null,
         kind: gameCount === 1 ? 'showdown' : (gameCount > 1 ? 'classic' : 'unknown')
-      };
-    }).filter(s => s.draftGroupId != null);
+      });
+    });
+    slates = Array.from(byId.values());
   } else {
     // Fallback: dedupe from contests. Game count/type usually isn't available
     // per contest in this shape, so these land in an "unknown" bucket.
@@ -622,6 +619,10 @@ async function onSlateChange(draftGroupId){
   await fetchPoolForDraftGroup(draftGroupId);
 }
 document.getElementById('refreshSlatesBtn').addEventListener('click', loadSlatesAndContests);
+document.getElementById('poolToggle').addEventListener('click', () => {
+  const row = document.getElementById('poolRow');
+  row.style.display = row.style.display === 'none' ? '' : 'none';
+});
 
 document.getElementById('contestSelect').addEventListener('change', (e) => {
   const contest = contestsCache.find(c => String(c.id) === String(e.target.value));
