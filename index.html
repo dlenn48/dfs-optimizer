@@ -788,6 +788,18 @@ async function fetchPoolForDraftGroup(draftGroupId){
 
     currentPool = draftables.map(normalizePlayer);
     document.getElementById('playerPool').value = poolToCsv(currentPool);
+
+    const hasSalaries = currentPool.some(p => p.salary > 0);
+    const hasDst = currentPool.some(p => p.pos === 'DST');
+    if(!hasSalaries || !hasDst){
+      setFetchStatus(
+        'Pulled ' + currentPool.length + ' players, but this draft group is missing ' +
+        (!hasSalaries ? 'salary data' : '') + (!hasSalaries && !hasDst ? ' and ' : '') + (!hasDst ? 'a DST/defense position' : '') +
+        ' — this is likely not a standard $50k Classic slate (could be Best Ball, Pick\u2019em, or a similar format). Try a different row in the Slate table instead, e.g. one tagged "(Sun-Mon)" or "(Touchdowns)".',
+        true
+      );
+      return;
+    }
     setFetchStatus('Pulled ' + currentPool.length + ' players automatically. Ready to generate.');
   } catch(err){
     currentPool = [];
