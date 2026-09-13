@@ -326,6 +326,7 @@ const endpointStatus = {
   weather: { label: 'Weather (Open-Meteo)', state: 'idle', detail: 'Runs during Generate.' },
   defense: { label: 'Defense Matchups (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
   injuries: { label: 'Practice Reports (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
+  depthChart: { label: 'QB Depth Chart (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
   snaps: { label: 'Snap Trends (nflverse)', state: 'idle', detail: 'Runs during Generate.' }
 };
 
@@ -586,6 +587,15 @@ function computeProjections(pool){
     // else below — a genuine Out/Doubtful should zero out or heavily
     // discount regardless of how good the matchup otherwise looks.
     if(ZERO_OUT_STATUSES.has(p.injuryStatus)){ p.proj = 0; return; }
+
+    // A backup QB (per the real depth chart, not just injury tags) almost
+    // never plays meaningful snaps. DraftKings doesn't flag this at all for
+    // a healthy backup, so this is treated as its own hard-exclusion step,
+    // same tier as injury news, rather than a soft nudge.
+    if(p.pos === 'QB' && p.qbDepthRank != null && p.qbDepthRank > 1){
+      p.proj = Math.round(baseline * 0.1 * 10) / 10;
+      return;
+    }
 
     let injuryFactor = 1;
     if(p.injuryStatus === 'D') injuryFactor = 0.8;
@@ -999,6 +1009,48 @@ async function fetchInjuryPracticeData(){
 // snap share is climbing recently can be a much better bet than a flat
 // season average would suggest (and vice versa for a shrinking role).
 let snapTrendCache = null;
+// QB starter/backup status from nflverse's depth chart data. DraftKings only
+// tags players who are injured — a perfectly healthy backup QB who simply
+// isn't starting gets no signal at all otherwise, and can look attractive by
+// the raw numbers alone. The Worker route pre-filters this to QB rows only
+// (see worker.js) since the source file is large.
+let qbDepthChartCache = null;
+async function fetchQbDepthChart(){
+  if(qbDepthChartCache) return qbDepthChartCache;
+  const proxy = getProxyUrl();
+  if(!proxy){ qbDepthChartCache = {}; setEndpointStatus('depthChart', 'skipped', 'No Proxy URL set.'); return {}; }
+  if(typeof Papa === 'undefined'){ qbDepthChartCache = {}; setEndpointStatus('depthChart', 'error', 'CSV parser failed to load.'); return {}; }
+  setEndpointStatus('depthChart', 'pending', 'Fetching QB depth chart…');
+  try{
+    const season = new Date().getFullYear();
+    const res = await fetch(proxy + '/nflverse/depth-charts?season=' + season);
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const csvText = await res.text();
+    const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
+    const rows = parsed.data || [];
+    if(!rows.length) throw new Error('CSV came back empty (or had no QB rows).');
+
+    // Multiple daily snapshots exist — keep only the most recent one.
+    const latestDt = rows.reduce((max, r) => (r.dt && r.dt > max ? r.dt : max), '');
+    const result = {};
+    rows.forEach(r => {
+      if(r.dt !== latestDt) return;
+      const name = r.player_name;
+      const rank = Number(r.pos_rank);
+      if(!name || isNaN(rank)) return;
+      result[normalizePlayerName(name)] = rank;
+    });
+
+    qbDepthChartCache = result;
+    setEndpointStatus('depthChart', 'ok', 'Loaded starter/backup status for ' + Object.keys(result).length + ' QBs.');
+    return result;
+  } catch(err){
+    qbDepthChartCache = {};
+    setEndpointStatus('depthChart', 'error', String(err.message || err));
+    return {};
+  }
+}
+
 async function fetchSnapCountTrends(){
   if(snapTrendCache) return snapTrendCache;
   const proxy = getProxyUrl();
@@ -1668,6 +1720,13 @@ async function generateLineups(){
       pool.forEach(p => {
         const key = normalizePlayerName(p.name);
         if(snapTrends[key]) p.snapTrend = snapTrends[key].trend;
+      });
+
+      const qbDepth = await fetchQbDepthChart();
+      pool.forEach(p => {
+        if(p.pos !== 'QB') return;
+        const key = normalizePlayerName(p.name);
+        if(qbDepth[key] != null) p.qbDepthRank = qbDepth[key];
       });
     }
     computeProjections(pool);
