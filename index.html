@@ -1042,7 +1042,11 @@ async function fetchQbDepthChart(){
     });
 
     qbDepthChartCache = result;
-    setEndpointStatus('depthChart', 'ok', 'Loaded starter/backup status for ' + Object.keys(result).length + ' QBs.');
+    const backupCount = Object.values(result).filter(rank => rank > 1).length;
+    setEndpointStatus('depthChart', 'ok',
+      'Loaded ' + Object.keys(result).length + ' QB depth chart entries (' + backupCount + ' flagged as backups, rank > 1). ' +
+      'If a specific player still isn\'t discounted, their name likely doesn\'t match between DraftKings and this file.'
+    );
     return result;
   } catch(err){
     qbDepthChartCache = {};
@@ -1285,6 +1289,7 @@ function describeLineup(built){
   );
   const risingRole = built.roster.filter(r => r.player.snapTrend != null && r.player.snapTrend >= 0.1);
   const fadingRole = built.roster.filter(r => r.player.snapTrend != null && r.player.snapTrend <= -0.1);
+  const qbNoDepthMatch = built.roster.filter(r => r.slot === 'QB' && r.player.qbDepthRank == null);
 
   const parts = [];
   if(stacks.length) parts.push('Stacks ' + stacks.join(', ') + ' pass-game pieces together.');
@@ -1297,6 +1302,7 @@ function describeLineup(built){
   if(flagged.length) parts.push('Includes injury-tagged players: ' + flagged.map(r => r.player.name + ' (' + r.player.injuryStatus + ')').join(', ') + '.');
   if(windy.length) parts.push('Wind ≥15mph expected for: ' + Array.from(new Set(windy.map(r => r.player.team))).join(', ') + '.');
   if(thinSampleValue.length) parts.push('Cheap plays backed by limited data — worth a manual gut-check: ' + thinSampleValue.map(r => r.player.name).join(', ') + '.');
+  if(qbNoDepthMatch.length) parts.push('Could not confirm starter status for: ' + qbNoDepthMatch.map(r => r.player.name).join(', ') + ' — verify manually before using.');
   if(!parts.length) parts.push('Highest-projected valid roster under the salary cap with no flagged risk factors.');
   return parts.join(' ');
 }
