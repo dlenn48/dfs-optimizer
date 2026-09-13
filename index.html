@@ -332,6 +332,15 @@ const STADIUMS = {
   TEN:{lat:36.1665,lon:-86.7713,dome:false}, WAS:{lat:38.9076,lon:-76.8645,dome:false}
 };
 
+// Public team-logo CDN, keyed by DraftKings' team abbreviation. A handful of
+// abbreviations differ from the source's own codes, hence the overrides.
+const LOGO_ABBR_OVERRIDES = { WAS: 'wsh' };
+function teamLogoUrl(team){
+  if(!team) return '';
+  const code = (LOGO_ABBR_OVERRIDES[team] || team).toLowerCase();
+  return 'https://a.espncdn.com/i/teamlogos/nfl/500/' + code + '.png';
+}
+
 function normalizePlayer(p){
   const name = p.displayName || p.DisplayName ||
     ((p.firstName || p.FirstName || '') + ' ' + (p.lastName || p.LastName || '')).trim() || 'Unknown';
@@ -339,8 +348,6 @@ function normalizePlayer(p){
   const posAliases = { DEF: 'DST', 'D/ST': 'DST', D: 'DST' };
   const pos = posAliases[posRaw] || posRaw;
   const team = (p.teamAbbreviation || p.TeamAbbreviation || '').toUpperCase();
-  const opp = (p.competition && (p.competition.name || p.competition.Name)) ||
-    (p.draftAlerts && p.draftAlerts.opponent) || '';
   const salary = Number(p.salary || p.Salary || 0);
   const injuryStatus = (p.injuryStatus || p.InjuryStatus || p.status || '').toUpperCase();
 
@@ -358,12 +365,20 @@ function normalizePlayer(p){
     }
   }
 
-  // Try to resolve which team is "home" from a competition string like
-  // "TB@CIN" (away@home is the standard sports convention).
+  // The competition field is a full matchup string like "TB@CIN" (away@home)
+  // — parse out which side is home and which team is actually the opponent,
+  // rather than dumping the whole string into "opponent".
   let homeTeam = null;
+  let opp = '';
   const compName = (p.competition && (p.competition.name || p.competition.Name)) || '';
   const m = compName.match(/([A-Z]{2,3})\s*@\s*([A-Z]{2,3})/);
-  if(m) homeTeam = m[2];
+  if(m){
+    const away = m[1], home = m[2];
+    homeTeam = home;
+    if(team === away) opp = home;
+    else if(team === home) opp = away;
+  }
+  if(!opp) opp = (p.draftAlerts && p.draftAlerts.opponent) || '';
 
   return {
     id: p.playerId || p.PlayerId || p.draftableId || p.DraftableId || (name + team),
@@ -1018,7 +1033,10 @@ generateBtn.addEventListener('click', generateLineups);
 function lineupCardHtml(lu){
   const rows = (lu.players || []).map(p => (
     '<tr><td class="slot">' + (p.slot||'') + '</td>' +
-    '<td>' + (p.name||'') + (p.team ? ' <span style="color:var(--muted)">' + p.team + (p.opponent ? ' vs ' + p.opponent : '') + '</span>' : '') + '</td>' +
+    '<td><div style="display:flex; align-items:center; gap:8px;">' +
+      '<img src="' + teamLogoUrl(p.team) + '" alt="" style="width:20px; height:20px; object-fit:contain; flex-shrink:0;" onerror="this.style.display=\'none\'">' +
+      '<span>' + (p.name||'') + (p.team ? ' <span style="color:var(--muted)">' + p.team + (p.opponent ? ' vs ' + p.opponent : '') + '</span>' : '') + '</span>' +
+    '</div></td>' +
     '<td class="sal nums">$' + Number(p.salary||0).toLocaleString() + '</td>' +
     '<td class="pts nums">' + (p.projPts != null ? p.projPts : '') + '</td></tr>'
   )).join('');
