@@ -589,6 +589,33 @@ function computeProjections(pool){
   const qbSalaries = pool.filter(p => p.pos === 'QB' && p.salary > 0).map(p => p.salary);
   const minQbSalary = qbSalaries.length ? Math.min(...qbSalaries) : null;
 
+  // Per-team QB salary picture, so we can tell an entrenched backup apart
+  // from a real starter using DraftKings' own in-game pricing rather than
+  // the player's historical average alone. A veteran backup can carry a
+  // perfectly "good" (non-thin) confidence tag and a real, non-floor salary
+  // purely because his historical numbers were earned starting elsewhere or
+  // in an earlier season — none of that predicts snaps behind a healthy
+  // starter this week. The old "near the pool-wide floor + thin data" check
+  // below only caught the narrowest version of this; it missed exactly the
+  // case that prompted this fix (a $8-9k backup with real, if stale, stats).
+  const qbSalariesByTeam = {};
+  pool.forEach(p => {
+    if(p.pos === 'QB' && p.salary > 0){
+      (qbSalariesByTeam[p.team] || (qbSalariesByTeam[p.team] = [])).push(p);
+    }
+  });
+  const qbMaxSalaryByTeam = {};
+  const qbStarterOutByTeam = {};
+  Object.keys(qbSalariesByTeam).forEach(team => {
+    const qbs = qbSalariesByTeam[team];
+    const maxSalary = Math.max(...qbs.map(q => q.salary));
+    qbMaxSalaryByTeam[team] = maxSalary;
+    // If the team's top-priced QB is already ruled out, don't punish the
+    // backup for being "behind" him on the depth chart — he's the starter now.
+    const starter = qbs.find(q => q.salary === maxSalary);
+    qbStarterOutByTeam[team] = !!(starter && ZERO_OUT_STATUSES.has(starter.injuryStatus));
+  });
+
   pool.forEach(p => {
     const baseline = baselineProjection(p);
 
@@ -597,14 +624,23 @@ function computeProjections(pool){
     // discount regardless of how good the matchup otherwise looks.
     if(ZERO_OUT_STATUSES.has(p.injuryStatus)){ p.proj = 0; return; }
 
-    // A QB priced at (or near) the salary floor, whose only historical data
-    // point is flagged "thin" (a single unreliable match, not a real recent
-    // sample), is almost certainly not this week's starter even though
-    // nothing tagged him as injured. Trust DraftKings' own rock-bottom
-    // pricing over one old data point.
-    if(p.pos === 'QB' && p.dataConfidence === 'thin' && minQbSalary != null && p.salary <= minQbSalary + 600){
-      p.proj = Math.round(baseline * 0.2 * 10) / 10;
-      return;
+    if(p.pos === 'QB'){
+      const teamMax = qbMaxSalaryByTeam[p.team];
+      // Any QB priced well below the other QB(s) DraftKings has rostered for
+      // the same team is behind them on the depth chart — trust that in-team
+      // salary ordering over a stale per-player historical average, unless
+      // the higher-priced teammate is already ruled out.
+      if(teamMax != null && p.salary < teamMax && p.salary <= teamMax * 0.85 && !qbStarterOutByTeam[p.team]){
+        p.proj = Math.round(baseline * 0.2 * 10) / 10;
+        return;
+      }
+      // Fallback for a team with only one rostered QB in this pool (no
+      // teammate to compare against): keep the original pool-wide-floor +
+      // thin-data guard for that narrower case.
+      if(p.dataConfidence === 'thin' && minQbSalary != null && p.salary <= minQbSalary + 600){
+        p.proj = Math.round(baseline * 0.2 * 10) / 10;
+        return;
+      }
     }
 
     let injuryFactor = 1;
@@ -1360,7 +1396,15 @@ function formatDate(raw){
   try{
     const d = new Date(raw);
     if(isNaN(d.getTime())) return null;
-    return d.toLocaleString([], { timeZone: 'America/New_York', weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    const opts = { timeZone: 'America/New_York', weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' };
+    // Surface the year whenever it isn't the current one. DraftKings' contest
+    // list has been observed to include a stale/orphaned entry from a prior
+    // season whose kickoff otherwise looks exactly like "today" (same
+    // weekday/month/day) — dropping the year made that indistinguishable
+    // from a real same-day slate in the picker.
+    const dateYear = d.toLocaleString([], { timeZone: 'America/New_York', year: 'numeric' });
+    if(dateYear !== String(new Date().getFullYear())) opts.year = 'numeric';
+    return d.toLocaleString([], opts);
   } catch(e){ return null; }
 }
 
@@ -1401,7 +1445,12 @@ function dateTabLabel(key){
   if(key === 'unknown') return 'Unknown date';
   const d = new Date(key + 'T00:00:00');
   if(isNaN(d.getTime())) return key;
-  return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+  const opts = { weekday: 'short', month: 'short', day: 'numeric' };
+  // Same reasoning as formatDate() — without the year, a stale prior-season
+  // entry sharing today's weekday/month/day would render an identical chip
+  // to the real "today" tab and be impossible to tell apart.
+  if(key.slice(0, 4) !== String(new Date().getFullYear())) opts.year = 'numeric';
+  return d.toLocaleDateString([], opts);
 }
 
 function slateRowLabel(s){
@@ -1668,7 +1717,28 @@ async function fetchPoolForDraftGroup(candidateIds){
       // required distinct slot the way it is in Classic.
       const hasDst = isShowdown ? true : pool.some(p => p.pos === 'DST');
 
-      if(hasSalaries && hasDst){
+      // Sanity-check a Showdown pool against the matchup the slate row
+      // claims to be ("AWAY @ HOME"). DraftKings' contest list occasionally
+      // surfaces a stale or mismatched entry — a DraftGroupId whose declared
+      // teams don't actually match the players it returns — and building a
+      // lineup from that silently mixes in players from an unrelated game.
+      // Reject the candidate here instead, the same way a missing-salary or
+      // missing-DST pool is rejected below.
+      let matchupMismatch = null;
+      if(isShowdown && activeSlate.matchup){
+        const expectedTeams = activeSlate.matchup.split('@').map(t => t.trim().toUpperCase()).filter(Boolean);
+        const actualTeams = Array.from(new Set(pool.map(p => p.team).filter(Boolean)));
+        const unexpected = actualTeams.filter(t => !expectedTeams.includes(t));
+        // Tolerate a small amount of noise (a handful of mistagged rows) but
+        // treat it as a real mismatch once it's a meaningful share of the pool.
+        if(expectedTeams.length === 2 && unexpected.length && unexpected.length >= Math.max(2, actualTeams.length * 0.15)){
+          matchupMismatch = 'draft group ' + id + ' is labeled "' + activeSlate.matchup + '" but its player pool includes ' +
+            unexpected.length + ' other team(s) (' + unexpected.join(', ') + ') — this looks like stale or mismatched ' +
+            'contest data from DraftKings, not a real pool for this matchup.';
+        }
+      }
+
+      if(hasSalaries && hasDst && !matchupMismatch){
         currentPool = pool;
         document.getElementById('playerPool').value = poolToCsv(currentPool);
         setFetchStatus(
@@ -1679,8 +1749,9 @@ async function fetchPoolForDraftGroup(candidateIds){
         setEndpointStatus('dkPool', 'ok', 'Pulled ' + currentPool.length + ' players from draft group ' + id + '.');
         return;
       }
-      // Not a standard salary-cap pool (e.g. Pick6/Best Ball) — try the next candidate, if any.
-      lastErr = new Error(
+      // Not a standard salary-cap pool (e.g. Pick6/Best Ball), or the
+      // matchup mismatch caught above — try the next candidate, if any.
+      lastErr = matchupMismatch ? new Error(matchupMismatch) : new Error(
         'draft group ' + id + ' has ' + pool.length + ' players but is missing ' +
         (!hasSalaries ? 'salary data' : '') + (!hasSalaries && !hasDst ? ' and ' : '') + (!hasDst ? 'a DST position' : '') +
         ' — likely not a standard salary-cap slate.'
