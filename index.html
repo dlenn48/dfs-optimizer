@@ -1744,11 +1744,23 @@ function describeLineup(built){
   // average instead. That's a materially different confidence level than a
   // mid-season projection and is easy to miss unless it's said outright.
   const nonDstCount = built.roster.filter(r => r.slot !== 'DST').length;
-  const thinCount = built.roster.filter(r => r.slot !== 'DST' && r.player.dataConfidence === 'thin').length;
+  const thinPlayers = built.roster.filter(r => r.slot !== 'DST' && r.player.dataConfidence === 'thin');
+  const thinCount = thinPlayers.length;
   const mostlyThinData = nonDstCount > 0 && thinCount / nonDstCount >= 0.5;
 
   const parts = [];
-  if(mostlyThinData) parts.push('Heads up: ' + thinCount + ' of ' + nonDstCount + ' skill-position players here have no current-season sample yet, so their projection is mostly last year\'s per-game average — treat this lineup\'s numbers as rougher than a mid-season projection.');
+  if(mostlyThinData){
+    let msg = 'Heads up: ' + thinCount + ' of ' + nonDstCount + ' skill-position players here have no current-season sample yet, so their projection is mostly last year\'s per-game average — treat this lineup\'s numbers as rougher than a mid-season projection.';
+    // If it's not literally everyone, name whoever's the exception — on a
+    // slate where NONE of these teams have played yet, every skill player
+    // should be thin, so a partial count like this is itself worth a
+    // second look rather than assuming the split is correct.
+    const notThin = built.roster.filter(r => r.slot !== 'DST' && r.player.dataConfidence !== 'thin');
+    if(notThin.length && notThin.length < nonDstCount){
+      msg += ' (' + notThin.map(r => r.player.name).join(', ') + ' shows up with a current-season sample already — worth double-checking that\'s real and not a stale or mismatched data match, especially if this is that team\'s own season opener.)';
+    }
+    parts.push(msg);
+  }
   if(stacks.length) parts.push('Stacks ' + stacks.join(', ') + ' pass-game pieces together.');
   if(highTotal.length) parts.push('Leans into high implied totals: ' + Array.from(new Set(highTotal.map(r => r.player.team))).join(', ') + '.');
   if(goodDstSpot.length) parts.push('DST faces a low implied opponent total.');
