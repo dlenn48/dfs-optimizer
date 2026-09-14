@@ -502,6 +502,33 @@ function normalizePlayer(p){
   };
 }
 
+// DraftKings' raw Showdown draftables feed lists most real people TWICE:
+// once as a CPT-slot-eligible entry (priced at 1.5x) and once as a
+// UTIL-slot-eligible entry (the normal 1x price) — draftables are keyed by
+// roster-slot eligibility, not by person. Confirmed directly against a real
+// Showdown pool (every player present at exactly a 1.5x/1x salary pair).
+// Any logic that aggregates by player/team — the QB depth-chart comparison
+// being the concrete case that broke — needs to see each real person once,
+// not twice at two different prices, or a player's own inflated CPT-priced
+// duplicate gets mistaken for a second, higher-priced "teammate" and used
+// to wrongly flag their real (UTIL-priced) row as a backup. Dedupe by
+// name+team and keep the cheaper (UTIL-priced) row as canonical — the 1.5x
+// captain multiplier is applied separately, in buildShowdownLineup, from
+// this one canonical salary. Applied unconditionally (Classic pools have no
+// such duplicates, so this is a no-op there) right where the pool is built,
+// so every downstream step — projections, lineup construction, the raw
+// pool textbox — sees a clean, deduped pool rather than each consumer
+// needing to defend against this itself.
+function dedupePoolEntries(pool){
+  const seen = new Map();
+  pool.forEach(p => {
+    const key = normalizePlayerName(p.name) + '|' + p.team;
+    const existing = seen.get(key);
+    if(!existing || p.salary < existing.salary) seen.set(key, p);
+  });
+  return Array.from(seen.values());
+}
+
 function poolToCsv(pool){
   return 'Name,Position,Team,Opponent,Salary,Injury\n' +
     pool.map(p => [p.name, p.pos, p.team, p.opp, p.salary, p.injuryStatus].join(',')).join('\n');
@@ -679,18 +706,37 @@ function computeProjections(pool){
 
     if(p.pos === 'QB'){
       const teamMax = qbMaxSalaryByTeam[p.team];
-      // Any QB priced well below the other QB(s) DraftKings has rostered for
-      // the same team is behind them on the depth chart — trust that in-team
+      // Any QB priced below the other QB(s) DraftKings has rostered for the
+      // same team is behind them on the depth chart — trust that in-team
       // salary ordering over a stale per-player historical average, unless
-      // the higher-priced teammate is already ruled out.
-      if(teamMax != null && p.salary < teamMax && p.salary <= teamMax * 0.85 && !qbStarterOutByTeam[p.team]){
+      // the higher-priced teammate is already ruled out. This used to only
+      // fire when the gap was wide (salary <= 85% of the starter's), on the
+      // theory that a close price meant a real committee — but QB is a
+      // single-player position with no committees, so DraftKings pricing a
+      // backup only modestly below the starter (a well-known name still
+      // gets real salary) doesn't mean he's competing for a role, it just
+      // means he's a notable backup. A real case: Fields priced at 90% of
+      // Mahomes' salary on the same Showdown slate — clearly still QB2, but
+      // the old 85% cutoff let him through fully undiscounted. Any gap at
+      // all below the team's top QB is enough.
+      if(teamMax != null && p.salary < teamMax && !qbStarterOutByTeam[p.team]){
         p.proj = Math.round(baseline * 0.2 * 10) / 10;
         return;
       }
       // Fallback for a team with only one rostered QB in this pool (no
       // teammate to compare against): keep the original pool-wide-floor +
-      // thin-data guard for that narrower case.
-      if(p.dataConfidence === 'thin' && minQbSalary != null && p.salary <= minQbSalary + 600){
+      // thin-data guard for that narrower case. This only means something
+      // when there are enough teams' worth of QBs in the pool for "near the
+      // floor" to imply a real scrub — on a small slate (a 2-team Showdown
+      // being the extreme case) the pool-wide floor IS just whichever real
+      // starter happens to be cheaper, so applying this there guaranteed
+      // one legitimate starting QB got zeroed every single time data was
+      // thin (true for virtually the whole pool in Week 1), independent of
+      // how far apart the two teams' salaries actually were. Gating it on a
+      // handful of distinct teams keeps it doing its job on a big Classic
+      // slate while never touching a real Showdown starter.
+      const qbTeamCount = Object.keys(qbSalariesByTeam).length;
+      if(qbTeamCount >= 4 && p.dataConfidence === 'thin' && minQbSalary != null && p.salary <= minQbSalary + 600){
         p.proj = Math.round(baseline * 0.2 * 10) / 10;
         return;
       }
@@ -2027,7 +2073,7 @@ async function fetchPoolForDraftGroup(candidateIds){
       const draftables = poolData.draftables || poolData.Draftables || [];
       if(!draftables.length) throw new Error('No players came back for this draft group.');
 
-      const pool = draftables.map(normalizePlayer);
+      const pool = dedupePoolEntries(draftables.map(normalizePlayer));
       const hasSalaries = pool.some(p => p.salary > 0);
       const activeSlate = slatesCache.find(s => String(s.draftGroupId) === String(activeDraftGroupId));
       const isShowdown = activeSlate && activeSlate.kind === 'showdown';
@@ -2157,10 +2203,10 @@ async function generateLineups(){
     // Fallback: parse a manually pasted/edited CSV. No weather/injury enrichment
     // is possible here since we don't have DraftKings' structured fields.
     const rows = manualCsv.split('\n').slice(1).filter(Boolean);
-    pool = rows.map((row, i) => {
+    pool = dedupePoolEntries(rows.map((row, i) => {
       const [name, pos, team, opp, salary] = row.split(',');
       return { id: 'manual-' + i, name, pos: (pos||'').toUpperCase(), team, opp, salary: Number(salary)||0, injuryStatus: '', avgPts: null, homeTeam: null };
-    });
+    }));
   }
 
   if(!pool || !pool.length){
