@@ -849,7 +849,21 @@ function normalizePlayerName(name){
 // predict. Touchdowns are the highest-variance, least-repeatable part of a
 // box score — someone running well above or below their volume-implied rate
 // is more likely due for regression than to keep it up.
-const TD_BENCHMARK_PER_100YD = { QB: 4.5, RB: 5.0, WR: 5.0, TE: 6.0 };
+//
+// These are TDs PER 100 YARDS, and real NFL rates cluster well under 1.0 —
+// e.g. 2024: Ja'Marr Chase led the league at 1708 rec yds / 17 TD (~1.0/100),
+// Justin Jefferson was 1533/10 (~0.65/100); Saquon Barkley led rushers at
+// 2005/13 (~0.65/100), Derrick Henry was 1921/16 (~0.83/100); Josh Allen
+// passed for 3731/28 (~0.75/100), Lamar Jackson 4172/41 (~0.98/100, an
+// outlier MVP year). The values this previously held (4.5-6.0) were 6-8x
+// those real rates, which meant this "regression toward the mean" was
+// actually regressing every player's TD total UP toward a rate no real NFL
+// player sustains over a season — silently inflating the season average
+// this feeds into for almost the entire pool. That is a much bigger and
+// more direct cause of "projections are too high" than anything upstream of
+// it (DK-exact scoring, thin-data caps, etc.), since this one multiplier
+// touches the historical average for every skill player.
+const TD_BENCHMARK_PER_100YD = { QB: 0.75, RB: 0.8, WR: 0.7, TE: 0.6 };
 const TD_POINT_VALUE = { QB: 4 }; // DK: passing TD = 4pts, rushing/receiving TD = 6pts
 
 // DraftKings' own NFL Classic scoring, computed directly from raw box-score
@@ -921,6 +935,19 @@ function regressedAvgPoints(r, games, rawPts){
   return adjustedTotalPts / games;
 }
 
+// Set by fetchSeasonStatsRaw when it discovers the "season" endpoint is
+// actually weekly-grain data (see below) — surfaced in the historical-stats
+// status message so this is visible instead of silently producing inflated
+// numbers forever.
+let seasonEndpointWasWeeklyGrain = false;
+
+// Columns summed when aggregating weekly rows into a season total — kept in
+// sync with what dkFantasyPoints() reads, plus the fumble/2pt columns it uses.
+const DK_STAT_COLUMNS = ['passing_yards','passing_tds','interceptions','passing_2pt_conversions',
+  'rushing_yards','rushing_tds','rushing_2pt_conversions',
+  'receiving_yards','receiving_tds','receiving_2pt_conversions','receptions',
+  'rushing_fumbles_lost','receiving_fumbles_lost','sack_fumbles_lost','special_teams_tds'];
+
 // Fetches one season's file and returns { key -> { avg, games } }, or null
 // on failure (distinct from {} = fetched fine but nothing usable).
 async function fetchSeasonStatsRaw(proxy, season){
@@ -932,13 +959,52 @@ async function fetchSeasonStatsRaw(proxy, season){
     const rows = parsed.data || [];
     if(!rows.length) throw new Error('CSV came back empty.');
 
-    const result = {};
+    // This endpoint is undocumented, and despite the name there's no actual
+    // guarantee it returns one pre-aggregated row per player per season —
+    // nflverse's own player-stats export is natively per-week (one row per
+    // player per game), and season totals are normally something you
+    // compute yourself, not a separate file nflverse ships. If that's what
+    // this route is quietly serving, every player has MULTIPLE rows here
+    // (one per week), and the original code below — which stores the row
+    // keyed only by player name — would silently keep whichever row
+    // happened to be processed last and use ITS single-game score as if it
+    // were the "season average." A player's best single game read as their
+    // season average is exactly the shape of "these projections are too
+    // high," so this is detected and handled explicitly rather than assumed
+    // away, the same way fetchWeeklyPlayerStats() already checks for a
+    // 'week' column on its own endpoint.
+    const isWeeklyGrain = 'week' in rows[0];
+
+    if(!isWeeklyGrain){
+      const result = {};
+      rows.forEach(r => {
+        const name = r.player_display_name || r.player_name;
+        const games = Number(r.games);
+        const pts = dkFantasyPoints(r);
+        if(!name || !games || isNaN(games) || isNaN(pts)) return;
+        result[normalizePlayerName(name)] = { avg: regressedAvgPoints(r, games, pts), games };
+      });
+      return result;
+    }
+
+    seasonEndpointWasWeeklyGrain = true;
+    const byPlayer = {};
     rows.forEach(r => {
       const name = r.player_display_name || r.player_name;
-      const games = Number(r.games);
-      const pts = dkFantasyPoints(r);
-      if(!name || !games || isNaN(games) || isNaN(pts)) return;
-      result[normalizePlayerName(name)] = { avg: regressedAvgPoints(r, games, pts), games };
+      if(!name) return;
+      const key = normalizePlayerName(name);
+      if(!byPlayer[key]) byPlayer[key] = { position: r.position, games: 0, totalPts: 0 };
+      const agg = byPlayer[key];
+      agg.games++;
+      agg.totalPts += dkFantasyPoints(r); // scored per game, so the 100/300-yard bonuses apply correctly per game rather than once against a season total
+      DK_STAT_COLUMNS.forEach(c => { agg[c] = (agg[c] || 0) + (Number(r[c]) || 0); });
+    });
+
+    const result = {};
+    Object.keys(byPlayer).forEach(key => {
+      const agg = byPlayer[key];
+      if(!agg.games) return;
+      result[key] = { avg: regressedAvgPoints(agg, agg.games, agg.totalPts), games: agg.games };
     });
     return result;
   } catch(err){
@@ -992,6 +1058,7 @@ async function fetchHistoricalStats(){
   try{
     const season = new Date().getFullYear();
     dkScoringTracker = { exact: 0, fallback: 0 };
+    seasonEndpointWasWeeklyGrain = false;
 
     // Prefer genuine per-week recency (last 4 games) if that file actually
     // exists; otherwise fall back to season-total + prior-year blending.
@@ -1038,10 +1105,13 @@ async function fetchHistoricalStats(){
     const sampleNote = thinShare >= 0.5
       ? ' No meaningful current-season sample yet for most of the pool (early in the season) — averages are mostly last year\'s per-game rate, regressed toward salary-implied value.'
       : '';
+    const grainNote = seasonEndpointWasWeeklyGrain
+      ? ' The season-totals endpoint turned out to actually be per-week rows, so each player\'s season line was built by summing their individual games rather than reading one pre-aggregated row.'
+      : '';
     setEndpointStatus('historical', 'ok',
       'Loaded ' + Object.keys(result).length + ' players' +
       (usedWeekly ? ' using real weekly recency data' : ' using season totals (no weekly file found — following the standard fallback)') +
-      scoringNote + '.' + sampleNote
+      scoringNote + '.' + sampleNote + grainNote
     );
     return result;
   } catch(err){
