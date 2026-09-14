@@ -1546,38 +1546,60 @@ function deriveSlates(data, contests){
   // this tool builds for.
   slates = slates.filter(s => !(s.tag && NON_STANDARD_SLATE_TAG_PATTERN.test(s.tag)));
 
-  // Corroborate every single-game Showdown slate's declared matchup against
-  // DraftKings' own multi-game Classic slates for the same date. A Classic
-  // slate's games list is the most trustworthy source of "what's actually
-  // being played today" this response gives us — it's the one DK can't get
-  // away with getting wrong, since real money rides on those games existing.
-  // A Showdown draft group whose matchup ISN'T backed up by any Classic
-  // slate that day (while others on the same date are) has the exact shape
-  // of a stale/orphaned DraftGroupId — a leftover row DraftKings' own lobby
-  // never actually offers as a playable slate for today. Only filter when we
-  // have at least one Classic slate to check against; with no corroborating
-  // data at all for a date, there's nothing to compare to, so nothing is cut.
-  const confirmedMatchupsByDate = new Map(); // dateKey -> Set of "AWAY @ HOME"
-  rawGroups.forEach(g => {
-    const games = g.Games || g.games || [];
-    if(games.length < 2) return; // only multi-game (Classic) slates count as corroboration
-    const startTime = g.StartDateEst ?? g.startDate ?? g.StartDate ?? g.ContestStartTime ?? g.startTime ?? null;
-    const dateKey = dateKeyOf(startTime);
-    games.forEach(game => {
-      const m = extractMatchup(game);
-      if(!m) return;
-      if(!confirmedMatchupsByDate.has(dateKey)) confirmedMatchupsByDate.set(dateKey, new Set());
-      confirmedMatchupsByDate.get(dateKey).add(m);
-    });
-  });
-  slates = slates.filter(s => {
-    if(s.kind !== 'showdown' || !s.matchup) return true;
-    const confirmed = confirmedMatchupsByDate.get(s.dateKey);
-    if(!confirmed || !confirmed.size) return true;
-    return confirmed.has(s.matchup);
+  // NOTE: an earlier version of this function tried to corroborate each
+  // Showdown slate's matchup against the *DraftGroups block's own* `Games`
+  // array on Classic slates. That didn't actually catch anything in
+  // practice — this endpoint is undocumented and the away/home field names
+  // guessed for that array (awayTeamAbbreviation/homeTeamAbbreviation, etc.)
+  // apparently don't match what DraftKings actually sends, so the check
+  // silently found nothing to compare against. See
+  // buildConfirmedTeamsByDate() below, which corroborates against real
+  // fetched player data instead (the same normalizePlayer() parsing already
+  // proven correct for building lineups) rather than a second guessed field
+  // shape.
+  return slates;
+}
+
+// Real teams playing on a given date, derived from actually-fetched player
+// pools rather than the DraftGroups block's own (apparently unreliable, see
+// the note in deriveSlates()) declared Games list. For each date, every
+// Classic (multi-game) slate's player pool is pulled and unioned — a Classic
+// slate spans that day's real games, so the set of teams appearing in it is
+// solid ground truth. Used to drop a single-game Showdown slate whose
+// declared matchup includes a team that isn't actually playing that day —
+// the shape a stale/orphaned DraftGroupId takes.
+async function buildConfirmedTeamsByDate(slates){
+  const proxy = getProxyUrl();
+  const classicByDate = {};
+  slates.forEach(s => {
+    if(s.kind !== 'classic') return;
+    if(!classicByDate[s.dateKey]) classicByDate[s.dateKey] = [];
+    classicByDate[s.dateKey].push(s);
   });
 
-  return slates;
+  const byDate = {};
+  await Promise.all(Object.entries(classicByDate).map(async ([dateKey, classicSlates]) => {
+    const teams = new Set();
+    await Promise.all(classicSlates.map(async (slate) => {
+      const ids = slate.candidateIds || [slate.draftGroupId];
+      for(const id of ids){
+        try{
+          const url = proxy
+            ? proxy + '/dk/draftgroup/' + encodeURIComponent(id)
+            : 'https://api.draftkings.com/draftgroups/v1/draftgroups/' + encodeURIComponent(id) + '/draftables';
+          const res = await fetch(url);
+          if(!res.ok) continue;
+          const data = await res.json();
+          const draftables = data.draftables || data.Draftables || [];
+          if(!draftables.length) continue;
+          draftables.map(normalizePlayer).forEach(p => { if(p.team) teams.add(p.team); });
+          break; // got usable data for this candidate — no need to try the rest
+        } catch(e){ /* try the next candidate id, if any */ }
+      }
+    }));
+    if(teams.size) byDate[dateKey] = teams;
+  }));
+  return byDate;
 }
 
 function renderDateTabs(){
@@ -1710,6 +1732,24 @@ async function loadSlatesAndContests(){
 
     slatesCache = deriveSlates(data, contestsCache);
     if(!slatesCache.length) throw new Error('Could not identify any slates from the response.');
+
+    // Drop any Showdown slate whose declared matchup includes a team that
+    // isn't actually playing that day, per the real player pools of that
+    // day's Classic slate(s) — see buildConfirmedTeamsByDate(). Fails open:
+    // if this lookup itself fails for any reason, the unfiltered slate list
+    // is kept rather than the picker breaking entirely.
+    try{
+      const confirmedTeamsByDate = await buildConfirmedTeamsByDate(slatesCache);
+      slatesCache = slatesCache.filter(s => {
+        if(s.kind !== 'showdown' || !s.matchup) return true;
+        const teams = confirmedTeamsByDate[s.dateKey];
+        if(!teams) return true; // no Classic pool available for this date to check against
+        const parts = s.matchup.split('@').map(t => t.trim().toUpperCase()).filter(Boolean);
+        if(parts.length !== 2) return true;
+        return parts.every(t => teams.has(t));
+      });
+    } catch(e){ /* validation is best-effort — keep the unfiltered list on failure */ }
+
     setEndpointStatus('dkContests', 'ok', 'Loaded ' + slatesCache.length + ' slates, ' + contestsCache.length + ' contests.');
 
     const dates = Array.from(new Set(slatesCache.map(s => s.dateKey))).sort();
