@@ -1320,8 +1320,9 @@ function dateTabLabel(key){
 
 function slateRowLabel(s){
   if(s.matchup) return s.matchup;
+  if(s.kind === 'showdown') return (s.tag ? s.tag + ' — ' : '') + 'matchup unknown';
   if(s.tag) return s.tag;
-  return s.kind === 'classic' ? 'Classic Main' : (s.kind === 'showdown' ? 'Showdown' : 'Slate ' + s.draftGroupId);
+  return s.kind === 'classic' ? 'Classic Main' : 'Slate ' + s.draftGroupId;
 }
 
 // Derive slates (draft groups) either from a dedicated DraftGroups block if
@@ -1373,6 +1374,24 @@ function deriveSlates(data, contests){
     slates = Array.from(seen.values());
   }
   slates.forEach(s => { s.dateKey = dateKeyOf(s.startTime); });
+
+  // For Showdown slates specifically, always try to show the actual matchup
+  // rather than a generic tag like "Featured" — a Showdown is inherently
+  // tied to one game, so a vague label defeats the point of picking the
+  // right one. If the direct team-name extraction above came up empty,
+  // fall back to scanning that draft group's own contest names, which often
+  // spell out the matchup even when the slate-level data doesn't.
+  const matchupPattern = /([A-Z]{2,3})\s*@\s*([A-Z]{2,3})/;
+  slates.forEach(s => {
+    if(s.matchup || s.kind !== 'showdown') return;
+    const relatedIds = s.candidateIds || [s.draftGroupId];
+    const relatedContest = contests.find(c => relatedIds.some(id => String(c.dg) === String(id)) && matchupPattern.test(c.name || ''));
+    if(relatedContest){
+      const m = relatedContest.name.match(matchupPattern);
+      s.matchup = m[1] + ' @ ' + m[2];
+    }
+  });
+
   return slates;
 }
 
