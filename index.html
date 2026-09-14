@@ -346,7 +346,8 @@ const endpointStatus = {
   weather: { label: 'Weather (Open-Meteo)', state: 'idle', detail: 'Runs during Generate.' },
   defense: { label: 'Defense Matchups (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
   injuries: { label: 'Practice Reports (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
-  snaps: { label: 'Snap Trends (nflverse)', state: 'idle', detail: 'Runs during Generate.' }
+  snaps: { label: 'Snap Trends (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
+  opportunity: { label: 'Opportunity Share Trend (nflverse)', state: 'idle', detail: 'Runs during Generate.' }
 };
 
 function setEndpointStatus(key, state, detail){
@@ -792,6 +793,19 @@ function computeProjections(pool){
 
     if(p.snapTrend != null){
       soft *= Math.max(0.92, Math.min(1.1, 1 + p.snapTrend * 0.5));
+    }
+
+    // Distinct from snapTrend above: this is a shift in the player's share
+    // of his team's actual targets/air-yards (wopr) or carries, which can
+    // move even when playing time itself is flat — e.g. becoming the primary
+    // read instead of the checkdown within the same snap count. Both wopr
+    // and rush-carry share are already 0-1 "share of team offense" values,
+    // so the same scale/clamp is used for either. Bounded a bit wider than
+    // snapTrend's, since a targets/role change is generally a more direct
+    // fantasy signal than raw snap percentage — but a "thin" baseline still
+    // gets the same reduced overall ceiling applied right below.
+    if(p.opportunityTrend != null){
+      soft *= Math.max(0.88, Math.min(1.18, 1 + p.opportunityTrend * 1.0));
     }
 
     soft = Math.max(0.75, Math.min(1.3, soft)); // the combined-swing clamp
@@ -1344,6 +1358,107 @@ async function fetchSnapCountTrends(){
   } catch(err){
     // snapTrendCache left unset on failure so the next attempt actually retries.
     setEndpointStatus('snaps', 'error', String(err.message || err));
+    return {};
+  }
+}
+
+// Recent-vs-prior share of team offensive opportunity — a distinct signal
+// from snap-count trend above: two players can have flat snap counts while
+// one of them starts seeing a bigger share of the actual passing-game looks
+// (or carries) within those snaps. That's the kind of role change that
+// predicts outperforming a projection still anchored to an older average.
+//
+// wopr ("Weighted Opportunity Rating") is nflverse's own pre-computed
+// metric for pass catchers: 1.5 * target_share + 0.7 * air_yards_share —
+// confirmed against nflverse's published stats dictionary
+// (nflfastr.com/reference/nfl_stats_variables.html). There's no equivalent
+// pre-built rushing-share column in the feed, so a back's share of his own
+// team's carries that week is computed here directly.
+let opportunityTrendCache = null;
+async function fetchOpportunityTrends(){
+  if(opportunityTrendCache) return opportunityTrendCache;
+  const proxy = getProxyUrl();
+  if(!proxy){ setEndpointStatus('opportunity', 'skipped', 'No Proxy URL set.'); return {}; }
+  if(typeof Papa === 'undefined'){ setEndpointStatus('opportunity', 'error', 'CSV parser failed to load.'); return {}; }
+  setEndpointStatus('opportunity', 'pending', 'Fetching opportunity-share trends…');
+  try{
+    const season = new Date().getFullYear();
+    const res = await fetch(proxy + '/nflverse/player-week?season=' + season, { cache: 'no-store' });
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const csvText = await res.text();
+    const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
+    const rows = parsed.data || [];
+    if(!rows.length) throw new Error('CSV came back empty.');
+    if(!('week' in rows[0])) throw new Error('No week column — not actually a per-week file.');
+
+    // Pass 1: each team's total carries per week, so an individual back's
+    // raw carry count can be turned into a share of his own team's work.
+    const teamWeekCarries = {};
+    rows.forEach(r => {
+      const team = r.recent_team || r.team;
+      const week = Number(r.week);
+      const carries = Number(r.carries);
+      if(!team || isNaN(week) || isNaN(carries)) return;
+      const tk = team + '|' + week;
+      teamWeekCarries[tk] = (teamWeekCarries[tk] || 0) + carries;
+    });
+
+    // Pass 2: each player's opportunity value per week — wopr (or a
+    // target/air-yards-share fallback if wopr itself isn't in this feed)
+    // for WR/TE, rush-carry share for RB. QB is skipped: a healthy starter
+    // is already ~100% of his team's passing-game "share" most weeks, so
+    // this signal doesn't distinguish anything useful for that position.
+    const byPlayer = {};
+    rows.forEach(r => {
+      const name = r.player_display_name || r.player_name;
+      const week = Number(r.week);
+      const pos = (r.position || '').toUpperCase();
+      if(!name || isNaN(week)) return;
+
+      let value = null, metric = null;
+      if(pos === 'WR' || pos === 'TE'){
+        const wopr = Number(r.wopr);
+        if(!isNaN(wopr)){
+          value = wopr; metric = 'wopr';
+        } else {
+          const ts = Number(r.target_share), ays = Number(r.air_yards_share);
+          if(!isNaN(ts) && !isNaN(ays)){ value = 1.5 * ts + 0.7 * ays; metric = 'wopr'; }
+        }
+      } else if(pos === 'RB'){
+        const team = r.recent_team || r.team;
+        const carries = Number(r.carries);
+        const teamTotal = team ? teamWeekCarries[team + '|' + week] : null;
+        if(!isNaN(carries) && teamTotal){ value = carries / teamTotal; metric = 'rushShare'; }
+      }
+      if(value == null || isNaN(value)) return;
+
+      const key = normalizePlayerName(name);
+      if(!byPlayer[key]) byPlayer[key] = { metric, games: [] };
+      byPlayer[key].games.push({ week, value });
+    });
+
+    const result = {};
+    Object.keys(byPlayer).forEach(key => {
+      const entry = byPlayer[key];
+      const games = entry.games.sort((a, b) => a.week - b.week);
+      // Need at least one prior game to compare against — a single data
+      // point is just this week's number, not a trend.
+      if(games.length < 2) return;
+      const latest = games[games.length - 1].value;
+      const prior = games.slice(0, -1);
+      const priorAvg = prior.reduce((s, g) => s + g.value, 0) / prior.length;
+      result[key] = { metric: entry.metric, latest, priorAvg, trend: latest - priorAvg };
+    });
+
+    opportunityTrendCache = result;
+    setEndpointStatus('opportunity', 'ok', Object.keys(result).length
+      ? 'Loaded opportunity-share trends for ' + Object.keys(result).length + ' players (target/air-yards share for pass catchers, rush-carry share for backs).'
+      : 'Loaded the weekly file, but no player yet has both a current game and a prior one to compare this season — expected early in the season.'
+    );
+    return result;
+  } catch(err){
+    // opportunityTrendCache left unset on failure so the next attempt retries.
+    setEndpointStatus('opportunity', 'error', String(err.message || err));
     return {};
   }
 }
@@ -2257,6 +2372,12 @@ async function generateLineups(){
       pool.forEach(p => {
         const key = normalizePlayerName(p.name);
         if(snapTrends[key]) p.snapTrend = snapTrends[key].trend;
+      });
+
+      const opportunityTrends = await fetchOpportunityTrends();
+      pool.forEach(p => {
+        const key = normalizePlayerName(p.name);
+        if(opportunityTrends[key]) p.opportunityTrend = opportunityTrends[key].trend;
       });
     }
     computeProjections(pool);
