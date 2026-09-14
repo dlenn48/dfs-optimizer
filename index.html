@@ -155,7 +155,7 @@
   <header class="top">
     <div>
       <div class="title display">Lineup Builder</div>
-      <div class="sub">NFL DFS · Classic contests · QB / RB / RB / WR / WR / WR / TE / FLEX / DST</div>
+      <div class="sub" id="formatSub">NFL DFS · Classic contests · QB / RB / RB / WR / WR / WR / TE / FLEX / DST</div>
     </div>
     <nav class="tabs">
       <button id="tabGenBtn" class="active">Generate</button>
@@ -1218,10 +1218,96 @@ function buildLineup(pool, cap, excludeIds){
   return { roster, totalSalary, totalProj };
 }
 
+// Showdown format is fundamentally different from Classic: 1 Captain slot
+// (scores 1.5x points, costs 1.5x salary) + 5 flexible UTIL slots, any
+// position, drawn from either team in the single game — not the 9-slot
+// QB/RB/RB/WR/WR/WR/TE/FLEX/DST structure. The 1.5x multiplier is computed
+// here directly from each player's normal salary/projection rather than
+// relying on DraftKings to have supplied a separate pre-priced "CPT" entry,
+// since that shape hasn't been independently verified against real Showdown
+// data — this way the math is self-contained and correct regardless.
+function buildShowdownLineup(pool, cap, excludeIds){
+  // Guard against DraftKings possibly listing the same real person twice
+  // (once as a lower-priced UTIL-shaped entry, once as a higher-priced
+  // CPT-shaped entry) — dedupe by identity and keep the cheaper one as the
+  // canonical base entry, since the 1.5x multiplier gets applied ourselves.
+  const seen = new Map();
+  pool.forEach(p => {
+    if(excludeIds.includes(p.id) || p.proj <= 0 || p.salary <= 0) return;
+    const key = normalizePlayerName(p.name) + '|' + p.team;
+    const existing = seen.get(key);
+    if(!existing || p.salary < existing.salary) seen.set(key, p);
+  });
+  const players = Array.from(seen.values());
+  if(players.length < 6) return null;
+
+  const candidates = players.slice().sort((a, b) => b.proj - a.proj).slice(0, 40); // bound the search for speed
+  let best = null;
+
+  for(const captain of candidates){
+    const captainSalary = Math.round(captain.salary * 1.5);
+    if(captainSalary > cap) continue;
+    const budget = cap - captainSalary;
+
+    const others = players.filter(p => p.id !== captain.id).sort((a, b) => b.proj - a.proj);
+    const util = [];
+    let spent = 0;
+    for(const p of others){
+      if(util.length >= 5) break;
+      if(spent + p.salary <= budget){
+        util.push(p);
+        spent += p.salary;
+      }
+    }
+    if(util.length < 5) continue;
+
+    const captainProj = Math.round(captain.proj * 1.5 * 10) / 10;
+    const totalProj = Math.round((captainProj + util.reduce((s, p) => s + p.proj, 0)) * 10) / 10;
+    const totalSalary = captainSalary + spent;
+
+    if(!best || totalProj > best.totalProj){
+      best = {
+        roster: [
+          { slot: 'CPT', player: { ...captain, salary: captainSalary, proj: captainProj } },
+          ...util.map(p => ({ slot: 'UTIL', player: p }))
+        ],
+        totalSalary,
+        totalProj
+      };
+    }
+  }
+
+  // Local-search polish: try upgrading any single UTIL slot to a better
+  // player within the remaining budget, same spirit as the Classic builder.
+  if(best){
+    let improved = true, iterations = 0;
+    while(improved && iterations < 50){
+      improved = false;
+      iterations++;
+      for(const entry of best.roster){
+        if(entry.slot !== 'UTIL') continue;
+        const usedIds = new Set(best.roster.map(r => r.player.id));
+        const budget = (cap - best.totalSalary) + entry.player.salary;
+        const alt = players
+          .filter(p => !usedIds.has(p.id) && p.salary <= budget && p.proj > entry.player.proj)
+          .sort((a, b) => b.proj - a.proj)[0];
+        if(alt){
+          best.totalSalary += alt.salary - entry.player.salary;
+          best.totalProj = Math.round((best.totalProj - entry.player.proj + alt.proj) * 10) / 10;
+          entry.player = alt;
+          improved = true;
+        }
+      }
+    }
+  }
+
+  return best;
+}
+
 function describeLineup(built){
   const stackMap = {};
   built.roster.forEach(r => {
-    if(['QB','WR','TE'].includes(r.slot === 'FLEX' ? r.player.pos : r.slot)){
+    if(['QB','WR','TE'].includes(r.player.pos)){
       stackMap[r.player.team] = (stackMap[r.player.team] || 0) + 1;
     }
   });
@@ -1378,12 +1464,14 @@ function deriveSlates(data, contests){
   // For Showdown slates specifically, always try to show the actual matchup
   // rather than a generic tag like "Featured" — a Showdown is inherently
   // tied to one game, so a vague label defeats the point of picking the
-  // right one. If the direct team-name extraction above came up empty,
-  // fall back to scanning that draft group's own contest names, which often
-  // spell out the matchup even when the slate-level data doesn't.
+  // right one. Only do this when the tag itself doesn't already reveal the
+  // matchup — a tag like "(Madden Stream SEA @ PHI)" already names the teams
+  // AND carries important context (this isn't a real NFL game), which a
+  // stripped-down "SEA @ PHI" would silently erase.
   const matchupPattern = /([A-Z]{2,3})\s*@\s*([A-Z]{2,3})/;
   slates.forEach(s => {
     if(s.matchup || s.kind !== 'showdown') return;
+    if(s.tag && matchupPattern.test(s.tag)) return; // tag already reveals the matchup, possibly with important extra context — leave it as-is
     const relatedIds = s.candidateIds || [s.draftGroupId];
     const relatedContest = contests.find(c => relatedIds.some(id => String(c.dg) === String(id)) && matchupPattern.test(c.name || ''));
     if(relatedContest){
@@ -1573,7 +1661,12 @@ async function fetchPoolForDraftGroup(candidateIds){
 
       const pool = draftables.map(normalizePlayer);
       const hasSalaries = pool.some(p => p.salary > 0);
-      const hasDst = pool.some(p => p.pos === 'DST');
+      const activeSlate = slatesCache.find(s => String(s.draftGroupId) === String(activeDraftGroupId));
+      const isShowdown = activeSlate && activeSlate.kind === 'showdown';
+      // Showdown pools don't need a separate DST requirement — DST (if
+      // present at all) is just another flexible UTIL option there, not a
+      // required distinct slot the way it is in Classic.
+      const hasDst = isShowdown ? true : pool.some(p => p.pos === 'DST');
 
       if(hasSalaries && hasDst){
         currentPool = pool;
@@ -1586,11 +1679,11 @@ async function fetchPoolForDraftGroup(candidateIds){
         setEndpointStatus('dkPool', 'ok', 'Pulled ' + currentPool.length + ' players from draft group ' + id + '.');
         return;
       }
-      // Not a standard salary-cap Classic pool (e.g. Pick6/Best Ball) — try the next candidate, if any.
+      // Not a standard salary-cap pool (e.g. Pick6/Best Ball) — try the next candidate, if any.
       lastErr = new Error(
         'draft group ' + id + ' has ' + pool.length + ' players but is missing ' +
         (!hasSalaries ? 'salary data' : '') + (!hasSalaries && !hasDst ? ' and ' : '') + (!hasDst ? 'a DST position' : '') +
-        ' — likely not a Classic salary-cap slate.'
+        ' — likely not a standard salary-cap slate.'
       );
     } catch(err){
       lastErr = err;
@@ -1613,6 +1706,12 @@ async function onSlateChange(draftGroupId){
   if(slate){
     document.getElementById('weekLabel').value = 'NFL — ' + (formatDate(slate.startTime) || 'date unknown') + ' — ' + slateRowLabel(slate);
     document.getElementById('salaryCap').value = slate.salaryCap || 50000;
+    const sub = document.getElementById('formatSub');
+    if(slate.kind === 'showdown'){
+      sub.textContent = 'NFL DFS · Showdown contest · CPT (1.5x) / UTIL / UTIL / UTIL / UTIL / UTIL';
+    } else {
+      sub.textContent = 'NFL DFS · Classic contests · QB / RB / RB / WR / WR / WR / TE / FLEX / DST';
+    }
   }
   renderSlateTable();
   renderContestOptionsForSlate(draftGroupId);
@@ -1726,7 +1825,11 @@ async function generateLineups(){
     }
     computeProjections(pool);
 
-    const lineup1 = buildLineup(pool, fields.salaryCap, []);
+    const activeSlate = slatesCache.find(s => String(s.draftGroupId) === String(activeDraftGroupId));
+    const isShowdown = activeSlate && activeSlate.kind === 'showdown';
+    const buildFn = isShowdown ? buildShowdownLineup : buildLineup;
+
+    const lineup1 = buildFn(pool, fields.salaryCap, []);
     if(!lineup1){
       const allCounts = {};
       const eligibleCounts = {};
@@ -1736,9 +1839,12 @@ async function generateLineups(){
         if(p.proj > 0 && p.salary > 0) eligibleCounts[key] = (eligibleCounts[key] || 0) + 1;
       });
       throw new Error(
-        'Could not build a valid lineup from this pool. Position counts in the raw pool: ' + JSON.stringify(allCounts) +
-        '. Eligible (salary>0 and proj>0) counts: ' + JSON.stringify(eligibleCounts) +
-        '. If a position DraftKings needs (QB/RB/WR/TE/DST) is missing or zero here, the "pos" field parsing likely needs adjusting for this slate\'s data shape.'
+        (isShowdown
+          ? 'Could not build a valid Showdown lineup (need at least 6 distinct players under the cap).'
+          : 'Could not build a valid lineup from this pool. If a position DraftKings needs (QB/RB/WR/TE/DST) is missing or zero here, the "pos" field parsing likely needs adjusting for this slate\'s data shape.'
+        ) +
+        ' Position counts in the raw pool: ' + JSON.stringify(allCounts) +
+        '. Eligible (salary>0 and proj>0) counts: ' + JSON.stringify(eligibleCounts) + '.'
       );
     }
 
@@ -1747,9 +1853,9 @@ async function generateLineups(){
       .sort((a,b) => b.player.salary - a.player.salary)
       .slice(0, 2)
       .map(r => r.player.id);
-    const lineup2 = buildLineup(pool, fields.salaryCap, lockOutIds) || lineup1;
+    const lineup2 = buildFn(pool, fields.salaryCap, lockOutIds) || lineup1;
 
-    const DISPLAY_ORDER = ['QB','RB','WR','TE','FLEX','DST'];
+    const DISPLAY_ORDER = isShowdown ? ['CPT','UTIL'] : ['QB','RB','WR','TE','FLEX','DST'];
     const lineups = [lineup1, lineup2].map((built, i) => ({
       label: i === 0 ? 'Optimal' : 'Variant (differentiated)',
       totalSalary: built.totalSalary,
