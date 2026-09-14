@@ -1460,6 +1460,17 @@ function slateRowLabel(s){
   return s.kind === 'classic' ? 'Classic Main' : 'Slate ' + s.draftGroupId;
 }
 
+// DraftKings' lobby feed bundles far more than the two standard salary-cap
+// game styles (Classic, Showdown Captain Mode) into the same DraftGroups
+// list: alt-broadcast contests (Madden Stream), quarter/half-only scoring,
+// single-stat props (Total Yards), and other specialty formats all share the
+// same shape. None of these are lineups this tool builds for, so any slate
+// whose tag/description matches one of these is dropped from the picker
+// entirely rather than left in to confuse "Classic" vs "Showdown". This is a
+// best-effort keyword list (the field itself is undocumented) — extend it if
+// another specialty format shows up.
+const NON_STANDARD_SLATE_TAG_PATTERN = /madden|total\s*yards|\b[1-4]q\b|\b[1-4]h\b|\bhalf\b|\bquarter\b|snake\s*draft|best\s*ball|single\s*stat|player\s*prop|\barcade\b|pick\s*6|pick6/i;
+
 // Derive slates (draft groups) either from a dedicated DraftGroups block if
 // DraftKings' response includes one, or by deduping the flat contest list —
 // field names here are best-guesses since this endpoint is undocumented.
@@ -1527,6 +1538,43 @@ function deriveSlates(data, contests){
       const m = relatedContest.name.match(matchupPattern);
       s.matchup = m[1] + ' @ ' + m[2];
     }
+  });
+
+  // Drop anything that isn't a standard Classic or Showdown Captain Mode
+  // slate (Madden Stream, quarter/half scoring, Total Yards, Pick6/Best
+  // Ball, etc.) — those use the same DraftGroup shape but aren't lineups
+  // this tool builds for.
+  slates = slates.filter(s => !(s.tag && NON_STANDARD_SLATE_TAG_PATTERN.test(s.tag)));
+
+  // Corroborate every single-game Showdown slate's declared matchup against
+  // DraftKings' own multi-game Classic slates for the same date. A Classic
+  // slate's games list is the most trustworthy source of "what's actually
+  // being played today" this response gives us — it's the one DK can't get
+  // away with getting wrong, since real money rides on those games existing.
+  // A Showdown draft group whose matchup ISN'T backed up by any Classic
+  // slate that day (while others on the same date are) has the exact shape
+  // of a stale/orphaned DraftGroupId — a leftover row DraftKings' own lobby
+  // never actually offers as a playable slate for today. Only filter when we
+  // have at least one Classic slate to check against; with no corroborating
+  // data at all for a date, there's nothing to compare to, so nothing is cut.
+  const confirmedMatchupsByDate = new Map(); // dateKey -> Set of "AWAY @ HOME"
+  rawGroups.forEach(g => {
+    const games = g.Games || g.games || [];
+    if(games.length < 2) return; // only multi-game (Classic) slates count as corroboration
+    const startTime = g.StartDateEst ?? g.startDate ?? g.StartDate ?? g.ContestStartTime ?? g.startTime ?? null;
+    const dateKey = dateKeyOf(startTime);
+    games.forEach(game => {
+      const m = extractMatchup(game);
+      if(!m) return;
+      if(!confirmedMatchupsByDate.has(dateKey)) confirmedMatchupsByDate.set(dateKey, new Set());
+      confirmedMatchupsByDate.get(dateKey).add(m);
+    });
+  });
+  slates = slates.filter(s => {
+    if(s.kind !== 'showdown' || !s.matchup) return true;
+    const confirmed = confirmedMatchupsByDate.get(s.dateKey);
+    if(!confirmed || !confirmed.size) return true;
+    return confirmed.has(s.matchup);
   });
 
   return slates;
