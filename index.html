@@ -320,6 +320,7 @@ function slugify(s){
 // small status strip so a failure in one source is obvious and isolated.
 const endpointStatus = {
   dkContests: { label: 'DK Contests', state: 'idle', detail: 'Not loaded yet.' },
+  slateValidation: { label: 'Slate Validation', state: 'idle', detail: 'Checks Showdown matchups against real Classic-slate rosters.' },
   dkPool: { label: 'DK Player Pool', state: 'idle', detail: 'Pick a slate to fetch.' },
   vegas: { label: 'Vegas Lines (Odds API)', state: 'idle', detail: 'Runs during Generate.' },
   historical: { label: 'Historical Stats (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
@@ -788,6 +789,59 @@ function normalizePlayerName(name){
 const TD_BENCHMARK_PER_100YD = { QB: 4.5, RB: 5.0, WR: 5.0, TE: 6.0 };
 const TD_POINT_VALUE = { QB: 4 }; // DK: passing TD = 4pts, rushing/receiving TD = 6pts
 
+// DraftKings' own NFL Classic scoring, computed directly from raw box-score
+// counting stats rather than trusting nflverse's built-in fantasy_points /
+// fantasy_points_ppr columns (what this used to read). Those are a
+// *different*, generic scoring formula: interceptions and lost fumbles cost
+// -2 there vs. DK's -1, and there's no equivalent of DK's +3 bonus for a
+// 100-yard rushing game, a 100-yard receiving game, or a 300-yard passing
+// game. Treating that generic total as "what this player scores on
+// DraftKings" was quietly wrong in both directions — this computes the real
+// thing from the underlying yards/TDs/turnovers instead.
+let dkScoringTracker = { exact: 0, fallback: 0 };
+function dkFantasyPoints(r){
+  const num = (v) => { const n = Number(v); return isNaN(n) ? 0 : n; };
+  const hasRawStats = r.passing_yards != null || r.rushing_yards != null || r.receiving_yards != null || r.receptions != null;
+  if(!hasRawStats){
+    // This particular feed didn't include the raw counting stats — fall
+    // back to nflverse's own total rather than scoring everyone zero. Not
+    // exact DK scoring (see comment above for how it differs), but better
+    // than nothing; tracked separately so the status panel can be honest
+    // about how much of the pool actually got real DK-scored numbers.
+    dkScoringTracker.fallback++;
+    const fallback = r.fantasy_points_ppr != null ? Number(r.fantasy_points_ppr) : Number(r.fantasy_points);
+    return isNaN(fallback) ? 0 : fallback;
+  }
+  dkScoringTracker.exact++;
+
+  const passYds = num(r.passing_yards);
+  const rushYds = num(r.rushing_yards);
+  const recYds = num(r.receiving_yards);
+  let pts = 0;
+
+  pts += passYds * 0.04;
+  pts += num(r.passing_tds) * 4;
+  pts += num(r.interceptions) * -1;
+  pts += num(r.passing_2pt_conversions) * 2;
+  if(passYds >= 300) pts += 3;
+
+  pts += rushYds * 0.1;
+  pts += num(r.rushing_tds) * 6;
+  pts += num(r.rushing_2pt_conversions) * 2;
+  if(rushYds >= 100) pts += 3;
+
+  pts += num(r.receptions) * 1;
+  pts += recYds * 0.1;
+  pts += num(r.receiving_tds) * 6;
+  pts += num(r.receiving_2pt_conversions) * 2;
+  if(recYds >= 100) pts += 3;
+
+  pts -= (num(r.rushing_fumbles_lost) + num(r.receiving_fumbles_lost) + num(r.sack_fumbles_lost)) * 1;
+  pts += num(r.special_teams_tds) * 6;
+
+  return pts;
+}
+
 function regressedAvgPoints(r, games, rawPts){
   const pos = (r.position || '').toUpperCase();
   const benchmark = TD_BENCHMARK_PER_100YD[pos];
@@ -819,7 +873,7 @@ async function fetchSeasonStatsRaw(proxy, season){
     rows.forEach(r => {
       const name = r.player_display_name || r.player_name;
       const games = Number(r.games);
-      const pts = r.fantasy_points_ppr != null ? Number(r.fantasy_points_ppr) : Number(r.fantasy_points);
+      const pts = dkFantasyPoints(r);
       if(!name || !games || isNaN(games) || isNaN(pts)) return;
       result[normalizePlayerName(name)] = { avg: regressedAvgPoints(r, games, pts), games };
     });
@@ -846,7 +900,7 @@ async function fetchWeeklyPlayerStats(proxy, season, lastNWeeks){
     rows.forEach(r => {
       const name = r.player_display_name || r.player_name;
       const week = Number(r.week);
-      const pts = r.fantasy_points_ppr != null ? Number(r.fantasy_points_ppr) : Number(r.fantasy_points);
+      const pts = dkFantasyPoints(r);
       if(!name || isNaN(week) || isNaN(pts)) return;
       const key = normalizePlayerName(name);
       if(!byPlayer[key]) byPlayer[key] = [];
@@ -874,6 +928,7 @@ async function fetchHistoricalStats(){
   setEndpointStatus('historical', 'pending', 'Fetching historical stats…');
   try{
     const season = new Date().getFullYear();
+    dkScoringTracker = { exact: 0, fallback: 0 };
 
     // Prefer genuine per-week recency (last 4 games) if that file actually
     // exists; otherwise fall back to season-total + prior-year blending.
@@ -909,9 +964,15 @@ async function fetchHistoricalStats(){
 
     historicalStatsCache = result;
     const usedWeekly = !!weekly;
+    const scoringNote = dkScoringTracker.exact > 0
+      ? (dkScoringTracker.fallback > 0
+          ? ' (' + dkScoringTracker.fallback + ' of ' + (dkScoringTracker.exact + dkScoringTracker.fallback) + ' rows lacked raw stats and used an approximate total instead of exact DK scoring)'
+          : ' using exact DraftKings scoring')
+      : ' — could not find raw box-score columns, so these are an approximate (non-DK) scoring total';
     setEndpointStatus('historical', 'ok',
       'Loaded ' + Object.keys(result).length + ' players' +
-      (usedWeekly ? ' using real weekly recency data' : ' using season totals (no weekly file found — following the standard fallback)') + '.'
+      (usedWeekly ? ' using real weekly recency data' : ' using season totals (no weekly file found — following the standard fallback)') +
+      scoringNote + '.'
     );
     return result;
   } catch(err){
@@ -1737,9 +1798,15 @@ async function loadSlatesAndContests(){
     // isn't actually playing that day, per the real player pools of that
     // day's Classic slate(s) — see buildConfirmedTeamsByDate(). Fails open:
     // if this lookup itself fails for any reason, the unfiltered slate list
-    // is kept rather than the picker breaking entirely.
+    // is kept rather than the picker breaking entirely. Status is surfaced
+    // rather than swallowed, so a failure here (e.g. the proxy rejecting the
+    // extra lookups) is visible instead of silently leaving stale slates in.
+    setEndpointStatus('slateValidation', 'pending', 'Checking Showdown matchups against real Classic-slate rosters…');
     try{
+      const beforeCount = slatesCache.filter(s => s.kind === 'showdown').length;
+      const classicDateCount = new Set(slatesCache.filter(s => s.kind === 'classic').map(s => s.dateKey)).size;
       const confirmedTeamsByDate = await buildConfirmedTeamsByDate(slatesCache);
+      const datesWithData = Object.keys(confirmedTeamsByDate).length;
       slatesCache = slatesCache.filter(s => {
         if(s.kind !== 'showdown' || !s.matchup) return true;
         const teams = confirmedTeamsByDate[s.dateKey];
@@ -1748,7 +1815,21 @@ async function loadSlatesAndContests(){
         if(parts.length !== 2) return true;
         return parts.every(t => teams.has(t));
       });
-    } catch(e){ /* validation is best-effort — keep the unfiltered list on failure */ }
+      const afterCount = slatesCache.filter(s => s.kind === 'showdown').length;
+      const dropped = beforeCount - afterCount;
+      if(classicDateCount === 0){
+        setEndpointStatus('slateValidation', 'ok', 'No Classic slate available on any date to check Showdown matchups against — nothing was filtered.');
+      } else if(datesWithData === 0){
+        setEndpointStatus('slateValidation', 'error', 'Could not fetch any Classic slate\'s player pool to validate against (proxy/network issue) — showing the unfiltered slate list.');
+      } else {
+        setEndpointStatus('slateValidation', 'ok', dropped > 0
+          ? 'Dropped ' + dropped + ' Showdown slate(s) whose matchup wasn\'t backed up by a real Classic-slate roster.'
+          : 'All Showdown matchups checked out against real Classic-slate rosters.'
+        );
+      }
+    } catch(e){
+      setEndpointStatus('slateValidation', 'error', 'Validation failed: ' + String(e && (e.message || e)) + ' — showing the unfiltered slate list.');
+    }
 
     setEndpointStatus('dkContests', 'ok', 'Loaded ' + slatesCache.length + ' slates, ' + contestsCache.length + ' contests.');
 
