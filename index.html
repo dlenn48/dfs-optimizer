@@ -137,7 +137,7 @@
   .slateRow .srGames{ color: var(--turf); font-size: 12px; white-space: nowrap; }
   .slateEmpty{ padding: 16px; color: var(--muted); font-size: 13px; text-align: center; }
 
-  .statusPanel{ display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
+  .statusPanel{ display:flex; flex-wrap:wrap; gap:8px; margin-bottom:6px; align-items:center; }
   .statusChip{
     display:flex; align-items:center; gap:6px; border:1px solid var(--line); background:var(--panel);
     padding:5px 10px; border-radius:2px; font-size:11.5px; color:var(--muted); cursor:default;
@@ -148,6 +148,23 @@
   .statusChip.error{ color: var(--chalk); border-color: var(--rust); }
   .statusChip.error .dot{ background: var(--rust); }
   .statusChip.pending .dot{ background: var(--gold); }
+
+  .statusToggle{
+    background:transparent; border:none; color: var(--gold); font-size:11.5px; cursor:pointer;
+    padding: 4px 0; margin-bottom: 8px; text-decoration: underline; text-underline-offset: 2px;
+  }
+  .statusDetails{ margin-bottom:14px; border:1px solid var(--line); border-radius:2px; overflow:hidden; }
+  .statusDetailRow{
+    display:flex; gap:10px; padding:8px 12px; border-bottom:1px solid rgba(43,70,54,0.5); font-size:12px; align-items:flex-start;
+  }
+  .statusDetailRow:last-child{ border-bottom:none; }
+  .statusDetailRow .sdLabel{ flex:0 0 170px; color: var(--chalk); display:flex; align-items:center; gap:6px; }
+  .statusDetailRow .sdLabel .dot{ width:8px; height:8px; border-radius:50%; background:var(--muted); flex-shrink:0; }
+  .statusDetailRow.ok .sdLabel .dot{ background: var(--turf); }
+  .statusDetailRow.error .sdLabel .dot{ background: var(--rust); }
+  .statusDetailRow.pending .sdLabel .dot{ background: var(--gold); }
+  .statusDetailRow .sdText{ color: var(--muted); line-height:1.4; }
+  .statusDetailRow.error .sdText{ color: var(--chalk); }
 </style>
 </head>
 <body>
@@ -232,6 +249,8 @@
 
       <div class="rightCol">
         <div id="statusPanel" class="statusPanel"></div>
+        <button type="button" id="statusToggleBtn" class="statusToggle">Hide diagnostic details ▴</button>
+        <div id="statusDetails" class="statusDetails"></div>
         <div id="resultsArea">
           <div class="empty">Paste your player pool on the left and hit Generate. Claude will research current injuries, weather, and matchups before building lineups.</div>
         </div>
@@ -337,17 +356,50 @@ function setEndpointStatus(key, state, detail){
   renderStatusPanel();
 }
 
+function escapeHtml(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+
+// Whether the always-visible diagnostic detail list is shown. Defaults to
+// open — the whole point is that these results (which source succeeded,
+// which fell back, why a slate got dropped, whether real DK scoring was
+// used, etc.) should be readable at a glance, not hidden behind a hover
+// tooltip that a screenshot or a quick glance never shows.
+let statusDetailsOpen = true;
+
 function renderStatusPanel(){
   const el = document.getElementById('statusPanel');
-  if(!el) return;
-  el.innerHTML = Object.values(endpointStatus).map(s => {
-    const icon = s.state === 'ok' ? '✓' : s.state === 'error' ? '✗' : s.state === 'pending' ? '…' : '–';
-    const cls = (s.state === 'ok' || s.state === 'error' || s.state === 'pending') ? s.state : '';
-    const title = (s.detail || '').replace(/"/g, '&quot;');
-    return '<div class="statusChip ' + cls + '" title="' + title + '"><span class="dot"></span>' + s.label + ' ' + icon + '</div>';
-  }).join('');
+  if(el){
+    el.innerHTML = Object.values(endpointStatus).map(s => {
+      const icon = s.state === 'ok' ? '✓' : s.state === 'error' ? '✗' : s.state === 'pending' ? '…' : '–';
+      const cls = (s.state === 'ok' || s.state === 'error' || s.state === 'pending') ? s.state : '';
+      const title = escapeHtml(s.detail || '');
+      return '<div class="statusChip ' + cls + '" title="' + title + '"><span class="dot"></span>' + escapeHtml(s.label) + ' ' + icon + '</div>';
+    }).join('');
+  }
+
+  const detailsEl = document.getElementById('statusDetails');
+  const toggleBtn = document.getElementById('statusToggleBtn');
+  if(toggleBtn) toggleBtn.textContent = statusDetailsOpen ? 'Hide diagnostic details ▴' : 'Show diagnostic details ▾';
+  if(detailsEl){
+    detailsEl.hidden = !statusDetailsOpen;
+    if(statusDetailsOpen){
+      detailsEl.innerHTML = Object.values(endpointStatus).map(s => {
+        const cls = (s.state === 'ok' || s.state === 'error' || s.state === 'pending') ? s.state : '';
+        const stateLabel = s.state === 'ok' ? 'OK' : s.state === 'error' ? 'ERROR' : s.state === 'pending' ? 'RUNNING…' : s.state === 'skipped' ? 'SKIPPED' : 'IDLE';
+        return '<div class="statusDetailRow ' + cls + '">' +
+          '<div class="sdLabel"><span class="dot"></span>' + escapeHtml(s.label) + ' — ' + stateLabel + '</div>' +
+          '<div class="sdText">' + escapeHtml(s.detail || '') + '</div>' +
+        '</div>';
+      }).join('');
+    }
+  }
 }
 renderStatusPanel();
+document.getElementById('statusToggleBtn').addEventListener('click', () => {
+  statusDetailsOpen = !statusDetailsOpen;
+  renderStatusPanel();
+});
 
 let contestsCache = [];
 let slatesCache = [];
