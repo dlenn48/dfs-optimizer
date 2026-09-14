@@ -326,7 +326,6 @@ const endpointStatus = {
   weather: { label: 'Weather (Open-Meteo)', state: 'idle', detail: 'Runs during Generate.' },
   defense: { label: 'Defense Matchups (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
   injuries: { label: 'Practice Reports (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
-  depthChart: { label: 'QB Depth Chart (nflverse)', state: 'idle', detail: 'Runs during Generate.' },
   snaps: { label: 'Snap Trends (nflverse)', state: 'idle', detail: 'Runs during Generate.' }
 };
 
@@ -580,6 +579,16 @@ function gameScriptFactor(pos, spread){
 }
 
 function computeProjections(pool){
+  // DraftKings prices players who aren't expected to play meaningful snaps
+  // at the salary floor for their position — that pricing IS the platform's
+  // own signal about role, without needing a separate depth chart source.
+  // Used below to catch the specific failure case: a cheap QB whose only
+  // historical match is a single old/unreliable data point (e.g. a big game
+  // from years ago on a different team) getting an inflated projection that
+  // ignores what DraftKings' own price is already telling us.
+  const qbSalaries = pool.filter(p => p.pos === 'QB' && p.salary > 0).map(p => p.salary);
+  const minQbSalary = qbSalaries.length ? Math.min(...qbSalaries) : null;
+
   pool.forEach(p => {
     const baseline = baselineProjection(p);
 
@@ -588,12 +597,13 @@ function computeProjections(pool){
     // discount regardless of how good the matchup otherwise looks.
     if(ZERO_OUT_STATUSES.has(p.injuryStatus)){ p.proj = 0; return; }
 
-    // A backup QB (per the real depth chart, not just injury tags) almost
-    // never plays meaningful snaps. DraftKings doesn't flag this at all for
-    // a healthy backup, so this is treated as its own hard-exclusion step,
-    // same tier as injury news, rather than a soft nudge.
-    if(p.pos === 'QB' && p.qbDepthRank != null && p.qbDepthRank > 1){
-      p.proj = Math.round(baseline * 0.1 * 10) / 10;
+    // A QB priced at (or near) the salary floor, whose only historical data
+    // point is flagged "thin" (a single unreliable match, not a real recent
+    // sample), is almost certainly not this week's starter even though
+    // nothing tagged him as injured. Trust DraftKings' own rock-bottom
+    // pricing over one old data point.
+    if(p.pos === 'QB' && p.dataConfidence === 'thin' && minQbSalary != null && p.salary <= minQbSalary + 600){
+      p.proj = Math.round(baseline * 0.2 * 10) / 10;
       return;
     }
 
@@ -1009,54 +1019,6 @@ async function fetchInjuryPracticeData(){
 // snap share is climbing recently can be a much better bet than a flat
 // season average would suggest (and vice versa for a shrinking role).
 let snapTrendCache = null;
-// QB starter/backup status from nflverse's depth chart data. DraftKings only
-// tags players who are injured — a perfectly healthy backup QB who simply
-// isn't starting gets no signal at all otherwise, and can look attractive by
-// the raw numbers alone. The Worker route pre-filters this to QB rows only
-// (see worker.js) since the source file is large.
-let qbDepthChartCache = null;
-async function fetchQbDepthChart(){
-  if(qbDepthChartCache) return qbDepthChartCache;
-  const proxy = getProxyUrl();
-  if(!proxy){ setEndpointStatus('depthChart', 'skipped', 'No Proxy URL set.'); return {}; }
-  if(typeof Papa === 'undefined'){ setEndpointStatus('depthChart', 'error', 'CSV parser failed to load.'); return {}; }
-  setEndpointStatus('depthChart', 'pending', 'Fetching QB depth chart…');
-  try{
-    const season = new Date().getFullYear();
-    const res = await fetch(proxy + '/nflverse/depth-charts?season=' + season, { cache: 'no-store' });
-    if(!res.ok) throw new Error('HTTP ' + res.status);
-    const csvText = await res.text();
-    console.log('[QB Depth Chart] raw response length (chars):', csvText.length, '| first 120 chars:', JSON.stringify(csvText.slice(0, 120)));
-    const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
-    const rows = parsed.data || [];
-    console.log('[QB Depth Chart] Papa.parse row count:', rows.length, '| parse errors:', JSON.stringify((parsed.errors || []).slice(0, 5)));
-    if(!rows.length) throw new Error('CSV came back empty (or had no QB rows).');
-
-    // Multiple daily snapshots exist — keep only the most recent one.
-    const latestDt = rows.reduce((max, r) => (r.dt && r.dt > max ? r.dt : max), '');
-    const result = {};
-    rows.forEach(r => {
-      if(r.dt !== latestDt) return;
-      const name = r.player_name;
-      const rank = Number(r.pos_rank);
-      if(!name || isNaN(rank)) return;
-      result[normalizePlayerName(name)] = rank;
-    });
-
-    qbDepthChartCache = result;
-    const backupCount = Object.values(result).filter(rank => rank > 1).length;
-    setEndpointStatus('depthChart', 'ok',
-      'Loaded ' + Object.keys(result).length + ' QB depth chart entries (' + backupCount + ' flagged as backups, rank > 1). ' +
-      'If a specific player still isn\'t discounted, their name likely doesn\'t match between DraftKings and this file.'
-    );
-    return result;
-  } catch(err){
-    // qbDepthChartCache left unset on failure so the next attempt actually retries.
-    setEndpointStatus('depthChart', 'error', String(err.message || err));
-    return {};
-  }
-}
-
 async function fetchSnapCountTrends(){
   if(snapTrendCache) return snapTrendCache;
   const proxy = getProxyUrl();
@@ -1291,7 +1253,6 @@ function describeLineup(built){
   );
   const risingRole = built.roster.filter(r => r.player.snapTrend != null && r.player.snapTrend >= 0.1);
   const fadingRole = built.roster.filter(r => r.player.snapTrend != null && r.player.snapTrend <= -0.1);
-  const qbNoDepthMatch = built.roster.filter(r => r.slot === 'QB' && r.player.qbDepthRank == null);
 
   const parts = [];
   if(stacks.length) parts.push('Stacks ' + stacks.join(', ') + ' pass-game pieces together.');
@@ -1304,7 +1265,6 @@ function describeLineup(built){
   if(flagged.length) parts.push('Includes injury-tagged players: ' + flagged.map(r => r.player.name + ' (' + r.player.injuryStatus + ')').join(', ') + '.');
   if(windy.length) parts.push('Wind ≥15mph expected for: ' + Array.from(new Set(windy.map(r => r.player.team))).join(', ') + '.');
   if(thinSampleValue.length) parts.push('Cheap plays backed by limited data — worth a manual gut-check: ' + thinSampleValue.map(r => r.player.name).join(', ') + '.');
-  if(qbNoDepthMatch.length) parts.push('Could not confirm starter status for: ' + qbNoDepthMatch.map(r => r.player.name).join(', ') + ' — verify manually before using.');
   if(!parts.length) parts.push('Highest-projected valid roster under the salary cap with no flagged risk factors.');
   return parts.join(' ');
 }
@@ -1314,7 +1274,7 @@ function formatDate(raw){
   try{
     const d = new Date(raw);
     if(isNaN(d.getTime())) return null;
-    return d.toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    return d.toLocaleString([], { timeZone: 'America/New_York', weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
   } catch(e){ return null; }
 }
 
@@ -1329,11 +1289,26 @@ function extractMatchup(game){
   return (away && home) ? (away + ' @ ' + home) : null;
 }
 
+// NFL games are always talked about by their US Eastern calendar date, not
+// UTC — Monday Night Football stays "Monday" even though an 8:15pm ET
+// kickoff is already past midnight UTC. Computing the date key from the raw
+// UTC timestamp (the previous approach) was quietly filing MNF-type games
+// under the wrong day's tab.
 function dateKeyOf(raw){
   if(!raw) return 'unknown';
   const d = new Date(raw);
   if(isNaN(d.getTime())) return 'unknown';
-  return d.toISOString().slice(0, 10);
+  try{
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'
+    }).formatToParts(d);
+    const y = parts.find(p => p.type === 'year').value;
+    const m = parts.find(p => p.type === 'month').value;
+    const day = parts.find(p => p.type === 'day').value;
+    return y + '-' + m + '-' + day;
+  } catch(e){
+    return d.toISOString().slice(0, 10); // fallback if Intl isn't available for some reason
+  }
 }
 
 function dateTabLabel(key){
@@ -1710,9 +1685,6 @@ async function generateLineups(){
           p.avgPts = hist[key].avg; // real recent form takes priority when we have it
           p.dataConfidence = hist[key].confidence;
         }
-        if(p.pos === 'QB' && key === normalizePlayerName('Carson Wentz')){
-          console.log('[Historical Stats] Carson Wentz -> DK-embedded avgPts before override:', p.avgPts, '| historical match found:', hist[key], '| salary:', p.salary);
-        }
       });
 
       const defenseMatchups = await fetchDefenseMatchups();
@@ -1731,15 +1703,6 @@ async function generateLineups(){
       pool.forEach(p => {
         const key = normalizePlayerName(p.name);
         if(snapTrends[key]) p.snapTrend = snapTrends[key].trend;
-      });
-
-      const qbDepth = await fetchQbDepthChart();
-      console.log('[QB Depth Chart] entries loaded:', Object.keys(qbDepth).length, '| carson wentz ->', qbDepth[normalizePlayerName('Carson Wentz')], '| daniel jones ->', qbDepth[normalizePlayerName('Daniel Jones')]);
-      pool.forEach(p => {
-        if(p.pos !== 'QB') return;
-        const key = normalizePlayerName(p.name);
-        if(qbDepth[key] != null) p.qbDepthRank = qbDepth[key];
-        if(p.pos === 'QB') console.log('[QB Depth Chart] pool player:', JSON.stringify(p.name), '-> key:', JSON.stringify(key), '-> rank found:', qbDepth[key]);
       });
     }
     computeProjections(pool);
