@@ -2195,7 +2195,11 @@ async function fetchPoolForDraftGroup(candidateIds){
         ? proxy + '/dk/draftgroup/' + encodeURIComponent(id)
         : 'https://api.draftkings.com/draftgroups/v1/draftgroups/' + encodeURIComponent(id) + '/draftables';
       const poolRes = await fetch(url);
-      if(!poolRes.ok) throw new Error('Player pool lookup failed (HTTP ' + poolRes.status + ').');
+      if(!poolRes.ok){
+        const upstreamNote = poolRes.headers.get('X-Upstream-Note');
+        const detail = upstreamNote ? ' — upstream said: ' + decodeURIComponent(upstreamNote) : '';
+        throw new Error('Player pool lookup failed (HTTP ' + poolRes.status + ')' + detail + '.');
+      }
       const poolData = await poolRes.json();
       const draftables = poolData.draftables || poolData.Draftables || [];
       if(!draftables.length) throw new Error('No players came back for this draft group.');
