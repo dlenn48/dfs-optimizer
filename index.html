@@ -272,7 +272,7 @@
        this against what's live to confirm a deploy actually landed before
        chasing a "the fix didn't work" report as a logic bug. -->
   <div style="text-align:center; font-size:11px; color:var(--muted); opacity:0.6; padding:16px 0 8px;">
-    build 2026-09-19.2
+    build 2026-09-19.3
   </div>
 </div>
 
@@ -1219,16 +1219,25 @@ async function fetchHistoricalStats(){
       const cur = curMap[key];
       const prev = prevMap[key];
 
+      // "thin" vs "good" is a confidence tag for the projection math (still
+      // gated on >=3 games — a game or two isn't enough to fully trust on
+      // its own). But "thin" was getting reported to the user as if it only
+      // ever meant "literally zero games played," which was true in Week 1
+      // but stopped being true the moment Week 2 started (2026-09-19: a
+      // Week 2 lineup said "8 of 8 ... have no current-season sample yet"
+      // when those players had all played a Week 1 game). Track the actual
+      // games-played count alongside the tag so the user-facing copy can
+      // tell "no sample at all yet" apart from "a real but small sample."
       if(wk && wk.games >= 2){
         // Real recent-form data is available and has enough games to trust on its own.
-        result[key] = { avg: Math.round(wk.avg * 10) / 10, confidence: wk.games >= 3 ? 'good' : 'thin' };
+        result[key] = { avg: Math.round(wk.avg * 10) / 10, confidence: wk.games >= 3 ? 'good' : 'thin', games: wk.games };
       } else if(cur && prev){
         const w = Math.min(cur.games / 4, 1);
-        result[key] = { avg: Math.round((cur.avg * w + prev.avg * (1 - w)) * 10) / 10, confidence: cur.games >= 3 ? 'good' : 'thin' };
+        result[key] = { avg: Math.round((cur.avg * w + prev.avg * (1 - w)) * 10) / 10, confidence: cur.games >= 3 ? 'good' : 'thin', games: cur.games };
       } else if(cur){
-        result[key] = { avg: Math.round(cur.avg * 10) / 10, confidence: cur.games >= 3 ? 'good' : 'thin' };
+        result[key] = { avg: Math.round(cur.avg * 10) / 10, confidence: cur.games >= 3 ? 'good' : 'thin', games: cur.games };
       } else if(prev){
-        result[key] = { avg: Math.round(prev.avg * 10) / 10, confidence: 'thin' }; // no current-season games at all
+        result[key] = { avg: Math.round(prev.avg * 10) / 10, confidence: 'thin', games: 0 }; // no current-season games at all
       }
     });
 
@@ -1239,12 +1248,18 @@ async function fetchHistoricalStats(){
           ? ' (' + dkScoringTracker.fallback + ' of ' + (dkScoringTracker.exact + dkScoringTracker.fallback) + ' rows lacked raw stats and used an approximate total instead of exact DK scoring)'
           : ' using exact DraftKings scoring')
       : ' — could not find raw box-score columns, so these are an approximate (non-DK) scoring total';
-    const thinShare = Object.keys(result).length
-      ? Object.values(result).filter(v => v.confidence === 'thin').length / Object.keys(result).length
-      : 0;
-    const sampleNote = thinShare >= 0.5
-      ? ' No meaningful current-season sample yet for most of the pool (early in the season) — averages are mostly last year\'s per-game rate, regressed toward salary-implied value.'
-      : '';
+    const thinEntries = Object.values(result).filter(v => v.confidence === 'thin');
+    const thinShare = Object.keys(result).length ? thinEntries.length / Object.keys(result).length : 0;
+    // Distinguish "genuinely zero current-season games" (true only in Week 1)
+    // from "a real but small sample" (true for most of the season-opening
+    // weeks, since the confidence bar is 3+ games) — see the comment above
+    // on the `games` field for why this split matters.
+    const zeroGameThinCount = thinEntries.filter(v => !(v.games > 0)).length;
+    const someGameThinCount = thinEntries.length - zeroGameThinCount;
+    const sampleNote = thinShare < 0.5 ? ''
+      : someGameThinCount > zeroGameThinCount
+        ? ' Most of the pool only has a game or two of current-season data so far — not enough yet for full confidence, so averages are still blended with last year\'s per-game rate.'
+        : ' No meaningful current-season sample yet for most of the pool (early in the season) — averages are mostly last year\'s per-game rate, regressed toward salary-implied value.';
     const grainNote = seasonEndpointWasWeeklyGrain
       ? ' The season-totals endpoint turned out to actually be per-week rows, so each player\'s season line was built by summing their individual games rather than reading one pre-aggregated row.'
       : '';
@@ -1819,25 +1834,35 @@ function describeLineup(built){
 
   // Beyond flagging individual cheap/thin plays above, call out when *most*
   // of this specific roster (not just the punt plays) is running on thin
-  // data — almost always because there's no current-season sample yet
-  // (Week 1) and the projections are leaning on last year's per-game
-  // average instead. That's a materially different confidence level than a
-  // mid-season projection and is easy to miss unless it's said outright.
+  // data — in Week 1 that's because there's no current-season sample yet;
+  // from Week 2 on (until players cross the 3-game "good" bar) it's instead
+  // a real but small sample. Those are materially different situations to
+  // tell a user, so the wording below picks between them rather than
+  // hardcoding the Week-1 "no sample yet" phrasing regardless of week (that
+  // bug shipped 2026-09-19: a Week 2 lineup said "have no current-season
+  // sample yet" about players who'd each already played a Week 1 game).
   const nonDstCount = built.roster.filter(r => r.slot !== 'DST').length;
   const thinPlayers = built.roster.filter(r => r.slot !== 'DST' && r.player.dataConfidence === 'thin');
   const thinCount = thinPlayers.length;
   const mostlyThinData = nonDstCount > 0 && thinCount / nonDstCount >= 0.5;
+  const zeroGameThinPlayers = thinPlayers.filter(r => !(r.player.dataGames > 0));
+  const someGameThinCount = thinPlayers.length - zeroGameThinPlayers.length;
 
   const parts = [];
   if(mostlyThinData){
-    let msg = 'Heads up: ' + thinCount + ' of ' + nonDstCount + ' skill-position players here have no current-season sample yet, so their projection is mostly last year\'s per-game average — treat this lineup\'s numbers as rougher than a mid-season projection.';
-    // If it's not literally everyone, name whoever's the exception — on a
-    // slate where NONE of these teams have played yet, every skill player
-    // should be thin, so a partial count like this is itself worth a
-    // second look rather than assuming the split is correct.
-    const notThin = built.roster.filter(r => r.slot !== 'DST' && r.player.dataConfidence !== 'thin');
-    if(notThin.length && notThin.length < nonDstCount){
-      msg += ' (' + notThin.map(r => r.player.name).join(', ') + ' shows up with a current-season sample already — worth double-checking that\'s real and not a stale or mismatched data match, especially if this is that team\'s own season opener.)';
+    const allTrulyZero = someGameThinCount === 0;
+    let msg = allTrulyZero
+      ? 'Heads up: ' + thinCount + ' of ' + nonDstCount + ' skill-position players here have no current-season sample yet, so their projection is mostly last year\'s per-game average — treat this lineup\'s numbers as rougher than a mid-season projection.'
+      : 'Heads up: ' + thinCount + ' of ' + nonDstCount + ' skill-position players here have only a game or two of current-season data so far (not yet enough for full confidence), so their projection still leans partly on last year\'s per-game average — treat this lineup\'s numbers as rougher than a mid-season projection.';
+    // If it's not literally everyone, name whoever's the exception — this
+    // is only actually suspicious in the true zero-games case (Week 1):
+    // once real games exist, a player crossing the 3-game "good" bar
+    // earlier than his teammates is normal, not a sign of stale data.
+    if(allTrulyZero){
+      const notThin = built.roster.filter(r => r.slot !== 'DST' && r.player.dataConfidence !== 'thin');
+      if(notThin.length && notThin.length < nonDstCount){
+        msg += ' (' + notThin.map(r => r.player.name).join(', ') + ' shows up with a current-season sample already — worth double-checking that\'s real and not a stale or mismatched data match, especially if this is that team\'s own season opener.)';
+      }
     }
     parts.push(msg);
   }
@@ -2449,6 +2474,7 @@ async function generateLineups(){
         if(hist[key] != null){
           p.avgPts = hist[key].avg; // real recent form takes priority when we have it
           p.dataConfidence = hist[key].confidence;
+          p.dataGames = hist[key].games; // real games-played count, for accurate "no sample" vs "small sample" copy
         }
       });
 
