@@ -272,7 +272,7 @@
        this against what's live to confirm a deploy actually landed before
        chasing a "the fix didn't work" report as a logic bug. -->
   <div style="text-align:center; font-size:11px; color:var(--muted); opacity:0.6; padding:16px 0 8px;">
-    build 2026-09-19.3
+    build 2026-09-19.4
   </div>
 </div>
 
@@ -577,15 +577,20 @@ async function fetchWeatherForTeam(team, dateKey, hour){
   let dayData = weatherCache[cacheKey];
   if(dayData === undefined){
     try{
+      // temperature_2m added 2026-09-19 alongside the wind/precip fields
+      // already fetched here, so the per-player weather badge (see
+      // weatherImpactBadges()) can flag cold/hot games too, not just wind
+      // and rain.
       const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + stadium.lat + '&longitude=' + stadium.lon +
-        '&hourly=windspeed_10m,precipitation_probability&windspeed_unit=mph' +
+        '&hourly=windspeed_10m,precipitation_probability,temperature_2m&windspeed_unit=mph&temperature_unit=fahrenheit' +
         '&start_date=' + dateKey + '&end_date=' + dateKey + '&timezone=America%2FNew_York';
       const res = await fetch(url);
       if(!res.ok) throw new Error('weather HTTP ' + res.status);
       const data = await res.json();
       dayData = {
         winds: (data.hourly && data.hourly.windspeed_10m) || [],
-        precs: (data.hourly && data.hourly.precipitation_probability) || []
+        precs: (data.hourly && data.hourly.precipitation_probability) || [],
+        temps: (data.hourly && data.hourly.temperature_2m) || []
       };
     } catch(err){
       dayData = null;
@@ -599,7 +604,39 @@ async function fetchWeatherForTeam(team, dateKey, hour){
   const h = (hour != null && hour >= 0 && hour <= 23) ? hour : 13;
   const wind = dayData.winds.length ? dayData.winds[Math.min(h, dayData.winds.length - 1)] : null;
   const precip = dayData.precs.length ? dayData.precs[Math.min(h, dayData.precs.length - 1)] : null;
-  return { wind, precip };
+  const temp = dayData.temps.length ? dayData.temps[Math.min(h, dayData.temps.length - 1)] : null;
+  return { wind, precip, temp };
+}
+
+// Turns a raw { wind, precip, temp } forecast into 0+ small badges for the
+// lineup table — added 2026-09-19 per Dan's request for a visual read on
+// weather, but deliberately NOT a badge for every game/every condition:
+// a mild 68°F partly-cloudy day isn't worth an icon since it can't move a
+// projection. Only conditions that actually feed computeProjections()'s
+// weather factors (windPassFactor/windRushFactor kick in above 8mph and
+// matter most >=15mph; precipPassFactor kicks in above 30% and matters
+// most >=50%) or that are extreme enough to plausibly affect play (hard
+// freeze, extreme heat) get surfaced. Domes and any game with no forecast
+// (fetch failed) get no badges, same as "nothing to flag" — not treated as
+// an error state here.
+function weatherImpactBadges(weather){
+  if(!weather) return null;
+  const badges = [];
+  if(weather.wind != null && weather.wind >= 15){
+    badges.push({ emoji: '💨', label: 'Wind ' + Math.round(weather.wind) + ' mph' });
+  }
+  if(weather.precip != null && weather.precip >= 50){
+    const likelySnow = weather.temp != null && weather.temp <= 34;
+    badges.push(likelySnow
+      ? { emoji: '🌨️', label: 'Snow chance ' + Math.round(weather.precip) + '%' }
+      : { emoji: '🌧️', label: 'Rain chance ' + Math.round(weather.precip) + '%' });
+  }
+  if(weather.temp != null && weather.temp <= 32){
+    badges.push({ emoji: '🥶', label: 'Cold, ' + Math.round(weather.temp) + '°F' });
+  } else if(weather.temp != null && weather.temp >= 95){
+    badges.push({ emoji: '🥵', label: 'Hot, ' + Math.round(weather.temp) + '°F' });
+  }
+  return badges.length ? badges : null;
 }
 
 async function enrichWithWeather(pool, dateKey){
@@ -2544,6 +2581,13 @@ async function generateLineups(){
         .sort((a, b) => DISPLAY_ORDER.indexOf(a.slot) - DISPLAY_ORDER.indexOf(b.slot))
         .map(r => ({
           slot: r.slot, name: r.player.name, team: r.player.team, opponent: r.player.opp,
+          // isHome added 2026-09-19 so the roster table can show "vs OPP"
+          // (hosting) vs. "@ OPP" (on the road) instead of always "vs" —
+          // null (not just false) when we never learned who's hosting at
+          // all, so the renderer can fall back to the old plain "vs" rather
+          // than confidently claiming a road game that isn't confirmed.
+          isHome: r.player.homeTeam ? (r.player.team === r.player.homeTeam) : null,
+          weatherBadges: weatherImpactBadges(r.player.weather),
           salary: r.player.salary, projPts: r.player.proj
         })),
       reasoning: describeLineup(built)
@@ -2560,12 +2604,31 @@ async function generateLineups(){
 }
 generateBtn.addEventListener('click', generateLineups);
 
+// "vs OPP" for the home team, "@ OPP" for the road team — added 2026-09-19
+// per Dan's request, since the table previously always said "vs" even for
+// road games. Falls back to the old plain "vs" only when home/away genuinely
+// couldn't be determined (isHome is null, not false) rather than guessing.
+function matchupLabel(p){
+  if(!p.opponent) return '';
+  return (p.isHome === false ? '@ ' : 'vs ') + p.opponent;
+}
+
+// Small inline weather emoji(s) next to the matchup, with the actual
+// forecast detail in the title tooltip — see weatherImpactBadges() for why
+// only wind/rain-or-snow/extreme-temp games get a badge at all.
+function weatherBadgesHtml(p){
+  if(!p.weatherBadges || !p.weatherBadges.length) return '';
+  return p.weatherBadges.map(b =>
+    '<span title="' + String(b.label).replace(/"/g, '&quot;') + '" style="margin-left:4px; cursor:default;">' + b.emoji + '</span>'
+  ).join('');
+}
+
 function lineupCardHtml(lu){
   const rows = (lu.players || []).map(p => (
     '<tr><td class="slot">' + (p.slot||'') + '</td>' +
     '<td><div style="display:flex; align-items:center; gap:8px;">' +
       '<img src="' + teamLogoUrl(p.team) + '" alt="" style="width:20px; height:20px; object-fit:contain; flex-shrink:0;" onerror="this.style.display=\'none\'">' +
-      '<span>' + (p.name||'') + (p.team ? ' <span style="color:var(--muted)">' + p.team + (p.opponent ? ' vs ' + p.opponent : '') + '</span>' : '') + '</span>' +
+      '<span>' + (p.name||'') + (p.team ? ' <span style="color:var(--muted)">' + p.team + (p.opponent ? ' ' + matchupLabel(p) : '') + '</span>' : '') + weatherBadgesHtml(p) + '</span>' +
     '</div></td>' +
     '<td class="sal nums">$' + Number(p.salary||0).toLocaleString() + '</td>' +
     '<td class="pts nums">' + (p.projPts != null ? p.projPts : '') + '</td></tr>'
