@@ -713,6 +713,38 @@ function computeProjections(pool){
     qbStarterOutByTeam[team] = !!(starter && ZERO_OUT_STATUSES.has(starter.injuryStatus));
   });
 
+  // RB/WR/TE analogue of the QB pool-wide-floor check, added 2026-09-19
+  // after it caught the optimizer recommending Jonathan Ward — a Ravens RB
+  // buried at RB4+ behind three fully healthy backs (Henry/Hill/Ali) per
+  // the real depth chart — in an Optimal lineup. His historical average
+  // looked usable (a small, noisy current-season sample let him through
+  // with non-"thin" confidence), but DraftKings' own pricing already said
+  // everything his stats couldn't: dead last among his own team's backs,
+  // at the position's rock-bottom league-wide price.
+  //
+  // This can't just reuse QB's "priced below any one teammate" rule — RB/WR
+  // both have real committees (a legitimate RB2 or WR2/WR3 is routinely
+  // priced below a teammate without being a non-factor), so that alone
+  // would misfire constantly. Requiring the combination of (a) cheapest of
+  // at least 3 OTHER same-position teammates AND (b) at/near the pool-wide
+  // floor for that position narrows this to the specific "buried body"
+  // case Ward represents, without touching a real committee role. Also,
+  // like the QB check, this stands down if any of those pricier teammates
+  // are actually ruled out — an injury ahead of him is exactly when a cheap
+  // body's role can legitimately jump.
+  const skillSalariesByTeamPos = { RB: {}, WR: {}, TE: {} };
+  pool.forEach(p => {
+    const byTeam = skillSalariesByTeamPos[p.pos];
+    if(byTeam && p.salary > 0){
+      (byTeam[p.team] || (byTeam[p.team] = [])).push(p);
+    }
+  });
+  const skillPosFloor = {};
+  ['RB','WR','TE'].forEach(pos => {
+    const salaries = pool.filter(p => p.pos === pos && p.salary > 0).map(p => p.salary);
+    skillPosFloor[pos] = salaries.length ? Math.min(...salaries) : null;
+  });
+
   pool.forEach(p => {
     const baseline = baselineProjection(p);
 
@@ -754,6 +786,20 @@ function computeProjections(pool){
       // slate while never touching a real Showdown starter.
       const qbTeamCount = Object.keys(qbSalariesByTeam).length;
       if(qbTeamCount >= 4 && p.dataConfidence === 'thin' && minQbSalary != null && p.salary <= minQbSalary + 600){
+        p.proj = Math.round(baseline * 0.2 * 10) / 10;
+        return;
+      }
+    }
+
+    if(['RB','WR','TE'].includes(p.pos) && p.salary > 0){
+      const teammates = skillSalariesByTeamPos[p.pos][p.team] || [];
+      const teamsAtPos = Object.keys(skillSalariesByTeamPos[p.pos]).length;
+      const posFloor = skillPosFloor[p.pos];
+      const pricierTeammates = teammates.filter(t => t.salary > p.salary);
+      const isCheapestOnTeam = teammates.length > 0 && p.salary === Math.min(...teammates.map(t => t.salary));
+      const allPricierTeammatesHealthy = pricierTeammates.every(t => !ZERO_OUT_STATUSES.has(t.injuryStatus));
+      if(teamsAtPos >= 4 && posFloor != null && p.salary <= posFloor + 600 &&
+         pricierTeammates.length >= 3 && isCheapestOnTeam && allPricierTeammatesHealthy){
         p.proj = Math.round(baseline * 0.2 * 10) / 10;
         return;
       }
