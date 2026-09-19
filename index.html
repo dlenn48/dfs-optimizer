@@ -377,7 +377,7 @@
        this against what's live to confirm a deploy actually landed before
        chasing a "the fix didn't work" report as a logic bug. -->
   <div style="text-align:center; font-size:11px; color:var(--muted); opacity:0.6; padding:16px 0 8px;">
-    build 2026-09-19.8
+    build 2026-09-19.9
   </div>
 </div>
 
@@ -2926,23 +2926,43 @@ function confidenceLabel(conf, games){
 // prior-year averages that fed into the one blended number the roster table
 // already shows, so a click answers "what is this projection actually based
 // on?" instead of just restating the projection.
+// "This season" and "Last season" both come from fetchSeasonStatsRaw(),
+// which runs regressedAvgPoints() on every row: a game's actual TDs are
+// blended 50/50 with a yardage-implied "expected" TD count before scoring,
+// specifically to keep one touchdown-heavy game from swinging the average
+// as if it were guaranteed to repeat (TDs are much less predictable/
+// repeatable game-to-game than yardage). "Last 4 games" comes from
+// fetchWeeklyPlayerStats() instead, which is each game's raw, unsmoothed
+// DK score. The two pipelines are NOT reconciled with each other — so for a
+// player with exactly one game so far, "This season" and "Last 4 games" can
+// legitimately show two different numbers for what looks like the same one
+// game (2026-09-19: Dan asked why these didn't match for a 1-game player;
+// this was working as designed, but the popup didn't explain itself, so the
+// row labels and note below were added to make the distinction visible
+// instead of looking like a bug/inconsistency).
 function playerStatsPopupHtml(p){
   const bd = p.statsBreakdown || {};
   const rows = [
-    ['This season', bd.curGames ? (bd.curAvg + ' avg over ' + bd.curGames + ' game' + (bd.curGames === 1 ? '' : 's')) : 'No games yet'],
+    ['This season (TD-smoothed)', bd.curGames ? (bd.curAvg + ' avg over ' + bd.curGames + ' game' + (bd.curGames === 1 ? '' : 's')) : 'No games yet'],
   ];
-  if(bd.recentGames) rows.push(['Last 4 games', bd.recentAvg + ' avg over ' + bd.recentGames + ' game' + (bd.recentGames === 1 ? '' : 's')]);
-  rows.push(['Last season', bd.prevGames ? (bd.prevAvg + ' avg over ' + bd.prevGames + ' game' + (bd.prevGames === 1 ? '' : 's')) : 'No data found']);
+  if(bd.recentGames) rows.push(['Last 4 games (raw)', bd.recentAvg + ' avg over ' + bd.recentGames + ' game' + (bd.recentGames === 1 ? '' : 's')]);
+  rows.push(['Last season (TD-smoothed)', bd.prevGames ? (bd.prevAvg + ' avg over ' + bd.prevGames + ' game' + (bd.prevGames === 1 ? '' : 's')) : 'No data found']);
   rows.push(['Used for projection', p.avgPts != null ? (p.avgPts + ' avg') : '—']);
 
   const matchup = p.opponent ? matchupLabel(p) : '';
+  // Only worth explaining the TD-smoothing when a smoothed number is
+  // actually on screen (curGames or prevGames > 0) — no point mentioning it
+  // for a player with neither.
+  const smoothingNote = (bd.curGames > 0 || bd.prevGames > 0)
+    ? ' Season numbers are touchdown-smoothed (actual TDs blended with a yardage-implied expected rate, to reduce TD-luck swings); the last-4-games number is each game’s raw score — with a small sample the two can legitimately disagree.'
+    : '';
   return (
     '<div class="psTitle display">' + escapeHtml(p.name || '') + '</div>' +
     '<div class="psSub">' + escapeHtml(p.team || '') + (matchup ? ' ' + escapeHtml(matchup) : '') +
       (p.salary != null ? ' · $' + Number(p.salary).toLocaleString() : '') +
       (p.projPts != null ? ' · ' + p.projPts + ' proj pts' : '') + '</div>' +
     rows.map(r => '<div class="psRow"><div class="psLabel">' + escapeHtml(r[0]) + '</div><div class="psVal">' + escapeHtml(String(r[1])) + '</div></div>').join('') +
-    '<div class="psNote">' + escapeHtml(confidenceLabel(p.dataConfidence, p.dataGames)) + '. ' + escapeHtml(STATS_SOURCE_LABEL[bd.source] || '') + '</div>'
+    '<div class="psNote">' + escapeHtml(confidenceLabel(p.dataConfidence, p.dataGames)) + '. ' + escapeHtml(STATS_SOURCE_LABEL[bd.source] || '') + escapeHtml(smoothingNote) + '</div>'
   );
 }
 
