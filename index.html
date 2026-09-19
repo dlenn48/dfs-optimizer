@@ -244,6 +244,15 @@
 </style>
 </head>
 <body>
+<div id="lockScreen">
+  <div class="lockCard">
+    <div class="lockTitle display">Lineup Builder</div>
+    <div class="lockSub">Enter your passcode to unlock this device. Once unlocked, this browser remembers it — no need to re-enter it next time (use "Forget saved connection on this device" in Advanced settings to re-lock).</div>
+    <input type="password" id="lockPasscode" inputmode="numeric" placeholder="Passcode" autocomplete="off">
+    <div class="lockError" id="lockError"></div>
+    <button type="button" class="btn" id="lockUnlockBtn">Unlock</button>
+  </div>
+</div>
 <div class="wrap">
   <header class="top">
     <div>
@@ -284,10 +293,7 @@
             <button type="button" id="forgetDeviceBtn" class="btn ghost" style="font-size:11px;">Forget saved connection on this device</button>
           </div>
         </details>
-        <div class="field">
-          <label for="weekLabel">Slate label</label>
-          <input type="text" id="weekLabel" placeholder="Pick a slate below to fill this in">
-        </div>
+        <input type="hidden" id="weekLabel" value="">
 
         <div class="field">
           <label>Slate <span id="slateLoadStatus" style="color:var(--muted); font-weight:400;"></span></label>
@@ -307,29 +313,12 @@
         <div id="fetchStatus" style="font-size:12px; color:var(--muted); margin-bottom:14px;"></div>
 
         <div class="field">
-          <label for="contestSelect">Contest <span style="color:var(--muted); font-weight:400;">(optional — fills in context below)</span></label>
-          <select id="contestSelect">
-            <option value="">Pick a slate first</option>
-          </select>
+          <label for="salaryCap">Salary cap</label>
+          <input type="number" id="salaryCap" value="50000" readonly style="opacity:0.7; cursor:not-allowed;">
+          <div style="font-size:11px; color:var(--muted); margin-top:4px;">Set automatically from the slate — DraftKings NFL is always $50,000.</div>
         </div>
-
-        <div class="row2">
-          <div class="field">
-            <label for="contestType">Contest type</label>
-            <select id="contestType">
-              <option value="cash">Cash / double-up</option>
-              <option value="small">Small-field (top-heavy)</option>
-              <option value="large" selected>Large-field GPP</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="salaryCap">Salary cap</label>
-            <input type="number" id="salaryCap" value="50000" readonly style="opacity:0.7; cursor:not-allowed;">
-            <div style="font-size:11px; color:var(--muted); margin-top:4px;">Set automatically from the slate — DraftKings NFL is always $50,000.</div>
-          </div>
-        </div>
+        <input type="hidden" id="contestType" value="large">
         <input type="hidden" id="numLineups" value="2">
-        <input type="hidden" id="context" value="">
         <div style="margin-bottom:14px;">
           <button type="button" id="poolToggle" class="btn ghost" style="font-size:11px;">Show/edit raw player pool</button>
         </div>
@@ -342,7 +331,7 @@
 
       <div class="rightCol">
         <div id="statusPanel" class="statusPanel"></div>
-        <button type="button" id="statusToggleBtn" class="statusToggle">Hide diagnostic details ▴</button>
+        <button type="button" id="statusToggleBtn" class="statusToggle">Show diagnostic details ▾</button>
         <div id="statusDetails" class="statusDetails"></div>
         <div id="resultsArea">
           <div class="empty">Paste your player pool on the left and hit Generate. Claude will research current injuries, weather, and matchups before building lineups.</div>
@@ -360,7 +349,7 @@
        this against what's live to confirm a deploy actually landed before
        chasing a "the fix didn't work" report as a logic bug. -->
   <div style="text-align:center; font-size:11px; color:var(--muted); opacity:0.6; padding:16px 0 8px;">
-    build 2026-09-19.6
+    build 2026-09-19.7
   </div>
 </div>
 
@@ -453,6 +442,110 @@ document.getElementById('forgetDeviceBtn').addEventListener('click', () => {
   location.reload();
 });
 
+// ---- Login gate (added 2026-09-19) ----
+// The two Proxy URLs are never shipped in this file as plain text. Instead
+// they're encrypted (AES-GCM, key derived from a passcode via PBKDF2-SHA256,
+// both via the browser's native Web Crypto API) and only the ciphertext,
+// salt and IV are embedded below. A visitor has to enter the correct
+// passcode once per device to decrypt them; a wrong passcode can't recover
+// the URLs at all (there's nothing to brute-force offline besides trying
+// passcodes against this same derivation, same as any PBKDF2-protected
+// secret). Once decrypted successfully, the plaintext URLs are cached in
+// this browser's localStorage (same keys the rest of the app already reads
+// via getProxyUrl()/getDraftGroupProxyUrl()) so the passcode isn't needed
+// again on this device — "Forget saved connection on this device" (above)
+// clears that cache and brings the lock screen back.
+const LOCK_SALT_B64 = 'bPLQMlzd/abNcsD98QhDLQ==';
+const LOCK_IV_B64 = 'NmeHPmtPOyibNfo9';
+const LOCK_CIPHERTEXT_B64 = 'Z+x9LgngWWkQadRUAgME3daWWtFXRqJ/kaa5BnOLYb587FJe//C0mfjarsyJsBkgOCQOPIjBQS+VjKCuRT93TW9nxBMjvRyipZFPHvswVQdIKjTZU95zSZRlHUKYDqsLZVpcGMXa7zzTckt5WAfvaTav2K59NhDTY2I5u812RtsfPho=';
+const LOCK_ITERATIONS = 250000;
+
+function lockB64ToBytes(b64){
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for(let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+async function decryptProxyUrls(passcode){
+  const enc = new TextEncoder();
+  const baseKey = await crypto.subtle.importKey('raw', enc.encode(passcode), 'PBKDF2', false, ['deriveKey']);
+  const aesKey = await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: lockB64ToBytes(LOCK_SALT_B64), iterations: LOCK_ITERATIONS, hash: 'SHA-256' },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['decrypt']
+  );
+  const plainBuf = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: lockB64ToBytes(LOCK_IV_B64) },
+    aesKey,
+    lockB64ToBytes(LOCK_CIPHERTEXT_B64)
+  );
+  return JSON.parse(new TextDecoder().decode(plainBuf));
+}
+
+let appStarted = false;
+function startApp(){
+  if(appStarted) return;
+  appStarted = true;
+  loadSlatesAndContests();
+}
+
+function hideLockScreen(){
+  const el = document.getElementById('lockScreen');
+  if(el) el.style.display = 'none';
+}
+
+async function attemptUnlock(){
+  const input = document.getElementById('lockPasscode');
+  const errEl = document.getElementById('lockError');
+  const btn = document.getElementById('lockUnlockBtn');
+  const passcode = input.value;
+  errEl.textContent = '';
+  if(!passcode){ errEl.textContent = 'Enter a passcode.'; return; }
+  btn.disabled = true;
+  try{
+    const urls = await decryptProxyUrls(passcode);
+    try{
+      localStorage.setItem('dfs-proxy-url', urls.proxyUrl || '');
+      localStorage.setItem('dfs-draftgroup-proxy-url', urls.draftGroupProxyUrl || '');
+    } catch(e){}
+    document.getElementById('proxyUrl').value = urls.proxyUrl || '';
+    document.getElementById('draftGroupProxyUrl').value = urls.draftGroupProxyUrl || '';
+    hideLockScreen();
+    startApp();
+  } catch(e){
+    // A wrong passcode makes AES-GCM's authentication check fail, which
+    // throws here rather than silently returning garbage — that's the
+    // actual "wrong passcode" detection, not a separate check.
+    errEl.textContent = 'Wrong passcode — try again.';
+    input.value = '';
+    input.focus();
+  } finally {
+    btn.disabled = false;
+  }
+}
+document.getElementById('lockUnlockBtn').addEventListener('click', attemptUnlock);
+document.getElementById('lockPasscode').addEventListener('keydown', (e) => {
+  if(e.key === 'Enter') attemptUnlock();
+});
+
+// Already unlocked this device before? Skip the lock screen and go
+// straight into the app, same as any other return visit. startApp() is
+// deferred with setTimeout rather than called inline here because this
+// code runs before later `let`/`const` declarations further down this
+// same script block (contestsCache, slatesCache, etc.) have executed —
+// calling straight into loadSlatesAndContests() at this point would hit
+// them before initialization. Deferring to a fresh task lets the rest of
+// the script finish running first; the delay is imperceptible.
+if(localStorage.getItem('dfs-proxy-url')){
+  hideLockScreen();
+  setTimeout(startApp, 0);
+} else {
+  document.getElementById('lockPasscode').focus();
+}
+
 function switchTab(tab){
   if(tab === 'gen'){
     genView.style.display = '';
@@ -501,11 +594,11 @@ function escapeHtml(s){
 }
 
 // Whether the always-visible diagnostic detail list is shown. Defaults to
-// open — the whole point is that these results (which source succeeded,
-// which fell back, why a slate got dropped, whether real DK scoring was
-// used, etc.) should be readable at a glance, not hidden behind a hover
-// tooltip that a screenshot or a quick glance never shows.
-let statusDetailsOpen = true;
+// collapsed (changed 2026-09-19 at Dan's request) — the detail rows (which
+// source succeeded, which fell back, why a slate got dropped, whether real
+// DK scoring was used, etc.) are still one click away via the toggle below,
+// they just don't need to be the first thing on screen every visit.
+let statusDetailsOpen = false;
 
 function renderStatusPanel(){
   const el = document.getElementById('statusPanel');
@@ -2353,40 +2446,6 @@ function renderSlateTable(){
   });
 }
 
-function renderContestOptionsForSlate(draftGroupId){
-  const select = document.getElementById('contestSelect');
-  const matches = contestsCache.filter(c => String(c.dg) === String(draftGroupId));
-  select.innerHTML = '';
-  if(!matches.length){
-    const opt = document.createElement('option');
-    opt.textContent = 'No contests found for this slate';
-    opt.disabled = true;
-    select.appendChild(opt);
-    return;
-  }
-  const blank = document.createElement('option');
-  blank.value = '';
-  blank.textContent = 'None selected';
-  select.appendChild(blank);
-
-  function appendGroup(label, list){
-    if(!list.length) return;
-    const optgroup = document.createElement('optgroup');
-    optgroup.label = label;
-    list.sort((a,b) => (a.fee||0) - (b.fee||0)).slice(0, 200).forEach(c => {
-      const opt = document.createElement('option');
-      opt.value = c.id;
-      const dateStr = formatDate(c.startTime);
-      opt.textContent = c.name + (dateStr ? ' — ' + dateStr : '') + (c.fee != null ? ' — $' + c.fee : '') + (c.entries != null ? ' — ' + c.entries + ' entries' : '');
-      optgroup.appendChild(opt);
-    });
-    select.appendChild(optgroup);
-  }
-
-  appendGroup('Featured', matches.filter(c => c.featured));
-  appendGroup('All Contests', matches.filter(c => !c.featured));
-}
-
 async function loadSlatesAndContests(){
   const refreshBtn = document.getElementById('refreshSlatesBtn');
   refreshBtn.disabled = true;
@@ -2580,29 +2639,12 @@ async function onSlateChange(draftGroupId){
     }
   }
   renderSlateTable();
-  renderContestOptionsForSlate(draftGroupId);
   await fetchPoolForDraftGroup(slate ? slate.candidateIds : [draftGroupId]);
 }
 document.getElementById('refreshSlatesBtn').addEventListener('click', loadSlatesAndContests);
 document.getElementById('poolToggle').addEventListener('click', () => {
   const row = document.getElementById('poolRow');
   row.style.display = row.style.display === 'none' ? '' : 'none';
-});
-
-document.getElementById('contestSelect').addEventListener('change', (e) => {
-  const contest = contestsCache.find(c => String(c.id) === String(e.target.value));
-  if(!contest) return;
-  const contextEl = document.getElementById('context');
-  const note = 'Contest: ' + contest.name + (formatDate(contest.startTime) ? ' — ' + formatDate(contest.startTime) : '') + ' — entry $' + (contest.fee ?? '?') + ' — ' + (contest.entries ?? '?') + ' entries.';
-  if(!contextEl.value.includes(note)) {
-    contextEl.value = contextEl.value ? (contextEl.value + '\n' + note) : note;
-  }
-  // Small heuristic to guess contest type from field size.
-  if(contest.entries != null){
-    const typeSelect = document.getElementById('contestType');
-    if(contest.entries <= 100) typeSelect.value = 'small';
-    else if(contest.entries >= 1000) typeSelect.value = 'large';
-  }
 });
 
 document.getElementById('manualToggle').addEventListener('click', () => {
@@ -2616,8 +2658,11 @@ document.getElementById('manualFetchBtn').addEventListener('click', () => {
   fetchPoolForDraftGroup(id);
 });
 
-// Kick everything off automatically on load — no manual fetch required.
-loadSlatesAndContests();
+// Kick everything off automatically once unlocked — no manual fetch
+// required. (Gated behind the login screen above: startApp() is called
+// either immediately, if this device was already unlocked, or right after
+// a correct passcode is entered — never before, so a locked visitor never
+// fires a slate/contest fetch with no proxy URL in place yet.)
 
 async function generateLineups(){
   const fields = {
@@ -2863,7 +2908,7 @@ async function loadHistoryList(){
         '<div class="hTitle display">' + it.weekLabel + '</div>' +
         '<button class="btn ghost" data-remove="' + i + '">Remove</button>' +
       '</div>' +
-      '<div class="hMeta">' + it.contestType + ' · ' + it.numLineups + ' lineups · ' + new Date(it.generatedAt).toLocaleString() + '</div>' +
+      '<div class="hMeta">' + it.numLineups + ' lineups · ' + new Date(it.generatedAt).toLocaleString() + '</div>' +
     '</div>'
   )).join('');
 
@@ -2875,7 +2920,7 @@ async function loadHistoryList(){
         const res = await store.get(key);
         const parsed = JSON.parse(res.value);
         histDetail.innerHTML = '<div class="empty" style="text-align:left;margin-bottom:16px;">' +
-          (parsed.fields.weekLabel || '') + ' — ' + parsed.fields.contestType + '</div>' +
+          (parsed.fields.weekLabel || '') + '</div>' +
           parsed.lineups.map(lineupCardHtml).join('');
       } catch(err){
         histDetail.innerHTML = '<div class="status error">Could not load this entry.</div>';
