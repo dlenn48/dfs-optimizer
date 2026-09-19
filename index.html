@@ -189,6 +189,11 @@
           <div style="font-size:11px; color:var(--muted); margin-top:4px;">Routes DraftKings calls through your own Cloudflare Worker, avoiding CORS blocks. Lineup generation itself now runs entirely in your browser — free, no API key needed.</div>
         </div>
         <div class="field">
+          <label for="draftGroupProxyUrl">Draft group proxy URL <span style="color:var(--muted); font-weight:400;">(optional override, just for the player pool)</span></label>
+          <input type="text" id="draftGroupProxyUrl" placeholder="Leave blank to use the Proxy URL above for everything">
+          <div style="font-size:11px; color:var(--muted); margin-top:4px;">DraftKings' player-pool endpoint (api.draftkings.com/draftgroups) blocks Cloudflare Workers specifically, even with a real Worker proxy in front of it. If that's biting you (player pool errors with everything else working), point this at a separate small Node.js service instead — everything else still goes through the Proxy URL above.</div>
+        </div>
+        <div class="field">
           <input type="hidden" id="apiKey" value="">
         </div>
         <div class="field">
@@ -302,6 +307,8 @@ const store = {
     if(savedKey) document.getElementById('apiKey').value = savedKey;
     const savedProxy = localStorage.getItem('dfs-proxy-url');
     if(savedProxy) document.getElementById('proxyUrl').value = savedProxy;
+    const savedDraftGroupProxy = localStorage.getItem('dfs-draftgroup-proxy-url');
+    if(savedDraftGroupProxy) document.getElementById('draftGroupProxyUrl').value = savedDraftGroupProxy;
   } catch(e){}
 })();
 document.getElementById('apiKey').addEventListener('change', (e) => {
@@ -310,8 +317,17 @@ document.getElementById('apiKey').addEventListener('change', (e) => {
 document.getElementById('proxyUrl').addEventListener('change', (e) => {
   try{ localStorage.setItem('dfs-proxy-url', e.target.value.trim().replace(/\/$/, '')); } catch(err){}
 });
+document.getElementById('draftGroupProxyUrl').addEventListener('change', (e) => {
+  try{ localStorage.setItem('dfs-draftgroup-proxy-url', e.target.value.trim().replace(/\/$/, '')); } catch(err){}
+});
 function getProxyUrl(){
   return document.getElementById('proxyUrl').value.trim().replace(/\/$/, '');
+}
+// Falls back to the main proxy when no override is set, so leaving this
+// field blank keeps the old single-Worker behavior exactly as-is.
+function getDraftGroupProxyUrl(){
+  const override = document.getElementById('draftGroupProxyUrl').value.trim().replace(/\/$/, '');
+  return override || getProxyUrl();
 }
 
 function switchTab(tab){
@@ -1953,7 +1969,7 @@ function deriveSlates(data, contests){
 // declared matchup includes a team that isn't actually playing that day —
 // the shape a stale/orphaned DraftGroupId takes.
 async function buildConfirmedTeamsByDate(slates){
-  const proxy = getProxyUrl();
+  const proxy = getDraftGroupProxyUrl();
   const classicByDate = {};
   slates.forEach(s => {
     if(s.kind !== 'classic') return;
@@ -2190,7 +2206,7 @@ async function fetchPoolForDraftGroup(candidateIds){
     const suffix = ids.length > 1 ? ' (option ' + (i + 1) + ' of ' + ids.length + ')' : '';
     setFetchStatus('Fetching player pool for draft group ' + id + suffix + '…');
     try{
-      const proxy = getProxyUrl();
+      const proxy = getDraftGroupProxyUrl();
       const url = proxy
         ? proxy + '/dk/draftgroup/' + encodeURIComponent(id)
         : 'https://api.draftkings.com/draftgroups/v1/draftgroups/' + encodeURIComponent(id) + '/draftables';
