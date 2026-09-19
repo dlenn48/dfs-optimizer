@@ -272,7 +272,7 @@
        this against what's live to confirm a deploy actually landed before
        chasing a "the fix didn't work" report as a logic bug. -->
   <div style="text-align:center; font-size:11px; color:var(--muted); opacity:0.6; padding:16px 0 8px;">
-    build 2026-09-19.4
+    build 2026-09-19.5
   </div>
 </div>
 
@@ -577,12 +577,16 @@ async function fetchWeatherForTeam(team, dateKey, hour){
   let dayData = weatherCache[cacheKey];
   if(dayData === undefined){
     try{
-      // temperature_2m added 2026-09-19 alongside the wind/precip fields
-      // already fetched here, so the per-player weather badge (see
-      // weatherImpactBadges()) can flag cold/hot games too, not just wind
-      // and rain.
+      // temperature_2m and weather_code added 2026-09-19 alongside the
+      // wind/precip fields already fetched here. temperature_2m lets the
+      // badge flag cold/hot games; weather_code (a WMO condition code —
+      // clear/cloudy/fog/thunderstorm/etc.) is what lets a genuinely calm
+      // outdoor game still show a baseline "clear"/"cloudy" icon instead of
+      // nothing at all (see weatherDisplayBadges() below for why that
+      // matters) and lets fog/thunderstorm register as impactful even when
+      // wind and precip-probability alone wouldn't trip either threshold.
       const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + stadium.lat + '&longitude=' + stadium.lon +
-        '&hourly=windspeed_10m,precipitation_probability,temperature_2m&windspeed_unit=mph&temperature_unit=fahrenheit' +
+        '&hourly=windspeed_10m,precipitation_probability,temperature_2m,weather_code&windspeed_unit=mph&temperature_unit=fahrenheit' +
         '&start_date=' + dateKey + '&end_date=' + dateKey + '&timezone=America%2FNew_York';
       const res = await fetch(url);
       if(!res.ok) throw new Error('weather HTTP ' + res.status);
@@ -590,7 +594,8 @@ async function fetchWeatherForTeam(team, dateKey, hour){
       dayData = {
         winds: (data.hourly && data.hourly.windspeed_10m) || [],
         precs: (data.hourly && data.hourly.precipitation_probability) || [],
-        temps: (data.hourly && data.hourly.temperature_2m) || []
+        temps: (data.hourly && data.hourly.temperature_2m) || [],
+        codes: (data.hourly && data.hourly.weather_code) || []
       };
     } catch(err){
       dayData = null;
@@ -605,20 +610,18 @@ async function fetchWeatherForTeam(team, dateKey, hour){
   const wind = dayData.winds.length ? dayData.winds[Math.min(h, dayData.winds.length - 1)] : null;
   const precip = dayData.precs.length ? dayData.precs[Math.min(h, dayData.precs.length - 1)] : null;
   const temp = dayData.temps.length ? dayData.temps[Math.min(h, dayData.temps.length - 1)] : null;
-  return { wind, precip, temp };
+  const code = dayData.codes.length ? dayData.codes[Math.min(h, dayData.codes.length - 1)] : null;
+  return { wind, precip, temp, code };
 }
 
-// Turns a raw { wind, precip, temp } forecast into 0+ small badges for the
-// lineup table — added 2026-09-19 per Dan's request for a visual read on
-// weather, but deliberately NOT a badge for every game/every condition:
-// a mild 68°F partly-cloudy day isn't worth an icon since it can't move a
-// projection. Only conditions that actually feed computeProjections()'s
-// weather factors (windPassFactor/windRushFactor kick in above 8mph and
-// matter most >=15mph; precipPassFactor kicks in above 30% and matters
-// most >=50%) or that are extreme enough to plausibly affect play (hard
-// freeze, extreme heat) get surfaced. Domes and any game with no forecast
-// (fetch failed) get no badges, same as "nothing to flag" — not treated as
-// an error state here.
+// Turns a raw { wind, precip, temp, code } forecast into 0+ small "impact"
+// badges — conditions that actually feed computeProjections()'s weather
+// factors (windPassFactor/windRushFactor kick in above 8mph and matter most
+// >=15mph; precipPassFactor kicks in above 30% and matters most >=50%) or
+// that are extreme/disruptive enough to plausibly affect play regardless
+// (hard freeze, extreme heat, fog, thunderstorm). Returns null when nothing
+// here rises to that level — weatherDisplayBadges() below is what decides
+// whether a plain "nothing notable" game still gets a neutral sky icon.
 function weatherImpactBadges(weather){
   if(!weather) return null;
   const badges = [];
@@ -636,7 +639,45 @@ function weatherImpactBadges(weather){
   } else if(weather.temp != null && weather.temp >= 95){
     badges.push({ emoji: '🥵', label: 'Hot, ' + Math.round(weather.temp) + '°F' });
   }
+  // WMO weather codes: 45/48 = fog, 95/96/99 = thunderstorm. Both can matter
+  // for a passing game (visibility, lightning delays) independent of the
+  // wind/precip-probability numbers, so they're checked on their own here
+  // rather than folded into the rain/snow check above.
+  if(weather.code === 45 || weather.code === 48){
+    badges.push({ emoji: '🌫️', label: 'Fog' });
+  } else if(weather.code === 95 || weather.code === 96 || weather.code === 99){
+    badges.push({ emoji: '⛈️', label: 'Thunderstorm' });
+  }
   return badges.length ? badges : null;
+}
+
+// A plain, non-impact sky-condition read (clear/partly cloudy/overcast) —
+// only reached when weatherImpactBadges() found nothing worth flagging.
+// WMO codes 0-3 cover the whole "nothing special happening" range; anything
+// else (drizzle/rain/snow/fog/storm codes that didn't already clear the
+// thresholds above) is left unlabeled rather than guessed at.
+function skyConditionBadge(code){
+  if(code === 0) return { emoji: '☀️', label: 'Clear' };
+  if(code === 1 || code === 2) return { emoji: '⛅', label: 'Partly cloudy' };
+  if(code === 3) return { emoji: '☁️', label: 'Overcast' };
+  return null;
+}
+
+// What the lineup table actually renders per player — added 2026-09-19
+// after Dan's first pass (impact-only badges) left every game in a mild
+// week showing nothing at all, which read as "the feature isn't working"
+// rather than "no bad weather." This guarantees every outdoor game with a
+// successful forecast shows *some* icon (even if it's just ☀️/⛅/☁️), while
+// still reserving the more specific wind/rain/snow/cold/heat/fog/storm
+// badges — with real numbers in the tooltip — for when it's actually
+// something that could move a projection. Domes and failed forecasts still
+// show nothing, same as before.
+function weatherDisplayBadges(weather){
+  const impact = weatherImpactBadges(weather);
+  if(impact) return impact;
+  if(!weather) return null;
+  const baseline = skyConditionBadge(weather.code);
+  return baseline ? [baseline] : null;
 }
 
 async function enrichWithWeather(pool, dateKey){
@@ -2587,7 +2628,7 @@ async function generateLineups(){
           // all, so the renderer can fall back to the old plain "vs" rather
           // than confidently claiming a road game that isn't confirmed.
           isHome: r.player.homeTeam ? (r.player.team === r.player.homeTeam) : null,
-          weatherBadges: weatherImpactBadges(r.player.weather),
+          weatherBadges: weatherDisplayBadges(r.player.weather),
           salary: r.player.salary, projPts: r.player.proj
         })),
       reasoning: describeLineup(built)
