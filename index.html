@@ -272,7 +272,7 @@
        this against what's live to confirm a deploy actually landed before
        chasing a "the fix didn't work" report as a logic bug. -->
   <div style="text-align:center; font-size:11px; color:var(--muted); opacity:0.6; padding:16px 0 8px;">
-    build 2026-09-19.1
+    build 2026-09-19.2
   </div>
 </div>
 
@@ -805,8 +805,19 @@ function computeProjections(pool){
       const pricierTeammates = teammates.filter(t => t.salary > p.salary);
       const isCheapestOnTeam = teammates.length > 0 && p.salary === Math.min(...teammates.map(t => t.salary));
       const allPricierTeammatesHealthy = pricierTeammates.every(t => !ZERO_OUT_STATUSES.has(t.injuryStatus));
+      // Originally required 3+ strictly-pricier teammates, based on synthetic
+      // test data that spread bench salaries out across distinct values. Real
+      // DraftKings pricing doesn't do that: it piles most deep-bench players
+      // at the exact same salary floor instead of spacing them out. Case in
+      // point (2026-09-19, BAL RBs): Henry $7200, Hill $4200, then Randall
+      // (IR) and Ali both tied with Ward at the $4000 floor. Only 2 teammates
+      // (Henry, Hill) were ever going to be strictly "pricier" no matter how
+      // many scrubs are glued to the floor with him — requiring 3 meant the
+      // check could never fire in this extremely common shape. 2 is still a
+      // real signal (needs a genuine RB1 and a clear RB2 above him, not just
+      // one other body) while actually matching how DK prices scrubs.
       if(teamsAtPos >= 4 && posFloor != null && p.salary <= posFloor + 600 &&
-         pricierTeammates.length >= 3 && isCheapestOnTeam && allPricierTeammatesHealthy){
+         pricierTeammates.length >= 2 && isCheapestOnTeam && allPricierTeammatesHealthy){
         p.proj = Math.round(baseline * 0.2 * 10) / 10;
         return;
       }
