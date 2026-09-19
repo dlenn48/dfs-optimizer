@@ -1,0 +1,13 @@
+{
+  "name": "dk-draftgroup-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone Node.js proxy for DraftKings' /draftgroups/v1/.../draftables endpoint. Exists only because that endpoint's Akamai bot protection blocks Cloudflare Workers specifically; everything else in the dfs-optimizer app still uses the Cloudflare Worker.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
