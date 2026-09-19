@@ -137,6 +137,34 @@
   }
   #lockScreen .lockError{ color: var(--rust); font-size: 12.5px; margin-bottom: 10px; min-height: 1.2em; }
 
+  /* Per-player prior-stats popup (added 2026-09-19). */
+  .popupBackdrop{
+    position: fixed; inset: 0; background: rgba(10,14,11,0.72); z-index: 900;
+    display:flex; align-items:center; justify-content:center; padding: 20px;
+  }
+  .popupBackdrop[hidden]{ display:none; }
+  .popupCard{
+    position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 2px;
+    padding: 22px 20px; max-width: 380px; width: 100%; max-height: 80vh; overflow-y: auto;
+  }
+  .popupClose{
+    position:absolute; top:8px; right:10px; background:transparent; border:none;
+    color: var(--muted); font-size: 22px; line-height:1; cursor:pointer; padding: 4px 8px;
+  }
+  .popupClose:hover{ color: var(--chalk); }
+  .psTitle{ font-size: 18px; margin-bottom: 2px; padding-right: 20px; }
+  .psSub{ color: var(--muted); font-size: 12.5px; margin-bottom: 14px; }
+  .psRow{ display:flex; justify-content:space-between; gap: 10px; padding: 7px 0; border-bottom: 1px solid rgba(43,70,54,0.5); font-size: 13.5px; }
+  .psRow:last-of-type{ border-bottom: none; }
+  .psRow .psLabel{ color: var(--muted); }
+  .psRow .psVal{ text-align:right; }
+  .psNote{ color: var(--muted); font-size: 11.5px; margin-top: 12px; line-height:1.4; }
+  .playerNameBtn{
+    background:none; border:none; padding:0; margin:0; font: inherit; color: var(--chalk);
+    cursor:pointer; text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 2px;
+  }
+  .playerNameBtn:hover{ text-decoration-color: var(--gold); }
+
   .panel{
     background: var(--panel);
     border: 1px solid var(--line);
@@ -349,7 +377,20 @@
        this against what's live to confirm a deploy actually landed before
        chasing a "the fix didn't work" report as a logic bug. -->
   <div style="text-align:center; font-size:11px; color:var(--muted); opacity:0.6; padding:16px 0 8px;">
-    build 2026-09-19.7
+    build 2026-09-19.8
+  </div>
+</div>
+
+<!-- Per-player prior-stats popup (added 2026-09-19) — a tap/click target on
+     each roster-row player name opens this with their season/recent/prior
+     averages, rather than only ever showing the single blended number used
+     in the projection. Hidden by default (unlike #lockScreen, there's no
+     "default open" concern here since it only ever appears in response to
+     a click). Backdrop click or the × closes it. -->
+<div id="playerStatsPopup" class="popupBackdrop" hidden>
+  <div class="popupCard">
+    <button type="button" class="popupClose" id="playerStatsCloseBtn" aria-label="Close">×</button>
+    <div id="playerStatsBody"></div>
   </div>
 </div>
 
@@ -1506,6 +1547,19 @@ async function fetchHistoricalStats(){
       const cur = curMap[key];
       const prev = prevMap[key];
 
+      // Full breakdown of every number that went into this player's baseline
+      // average, kept alongside the single blended `avg` below — added
+      // 2026-09-19 so the roster table can show a per-player stats popup
+      // ("what is this projection actually based on?") instead of only the
+      // one final number. round1() just rounds to 1 decimal, matching the
+      // rounding already applied to `avg` elsewhere in this function.
+      const round1 = (n) => Math.round(n * 10) / 10;
+      const breakdown = {
+        curAvg: cur ? round1(cur.avg) : null, curGames: cur ? cur.games : 0,
+        prevAvg: prev ? round1(prev.avg) : null, prevGames: prev ? prev.games : 0,
+        recentAvg: wk ? round1(wk.avg) : null, recentGames: wk ? wk.games : 0
+      };
+
       // "thin" vs "good" is a confidence tag for the projection math (still
       // gated on >=3 games — a game or two isn't enough to fully trust on
       // its own). But "thin" was getting reported to the user as if it only
@@ -1517,14 +1571,18 @@ async function fetchHistoricalStats(){
       // tell "no sample at all yet" apart from "a real but small sample."
       if(wk && wk.games >= 2){
         // Real recent-form data is available and has enough games to trust on its own.
-        result[key] = { avg: Math.round(wk.avg * 10) / 10, confidence: wk.games >= 3 ? 'good' : 'thin', games: wk.games };
+        breakdown.source = 'recent';
+        result[key] = { avg: round1(wk.avg), confidence: wk.games >= 3 ? 'good' : 'thin', games: wk.games, breakdown };
       } else if(cur && prev){
         const w = Math.min(cur.games / 4, 1);
-        result[key] = { avg: Math.round((cur.avg * w + prev.avg * (1 - w)) * 10) / 10, confidence: cur.games >= 3 ? 'good' : 'thin', games: cur.games };
+        breakdown.source = 'blend';
+        result[key] = { avg: round1(cur.avg * w + prev.avg * (1 - w)), confidence: cur.games >= 3 ? 'good' : 'thin', games: cur.games, breakdown };
       } else if(cur){
-        result[key] = { avg: Math.round(cur.avg * 10) / 10, confidence: cur.games >= 3 ? 'good' : 'thin', games: cur.games };
+        breakdown.source = 'current';
+        result[key] = { avg: round1(cur.avg), confidence: cur.games >= 3 ? 'good' : 'thin', games: cur.games, breakdown };
       } else if(prev){
-        result[key] = { avg: Math.round(prev.avg * 10) / 10, confidence: 'thin', games: 0 }; // no current-season games at all
+        breakdown.source = 'prior';
+        result[key] = { avg: round1(prev.avg), confidence: 'thin', games: 0, breakdown }; // no current-season games at all
       }
     });
 
@@ -2714,6 +2772,7 @@ async function generateLineups(){
           p.avgPts = hist[key].avg; // real recent form takes priority when we have it
           p.dataConfidence = hist[key].confidence;
           p.dataGames = hist[key].games; // real games-played count, for accurate "no sample" vs "small sample" copy
+          p.statsBreakdown = hist[key].breakdown; // current/prior/recent averages, for the per-player stats popup
         }
       });
 
@@ -2790,7 +2849,15 @@ async function generateLineups(){
           // than confidently claiming a road game that isn't confirmed.
           isHome: r.player.homeTeam ? (r.player.team === r.player.homeTeam) : null,
           weatherBadges: weatherDisplayBadges(r.player.weather),
-          salary: r.player.salary, projPts: r.player.proj
+          salary: r.player.salary, projPts: r.player.proj,
+          // Snapshot of the historical-stats breakdown at generation time, for
+          // the "prior stats" popup added 2026-09-19 — stored per-player on
+          // the lineup itself (not looked up live) so it still works from a
+          // saved History entry after the underlying pool is gone.
+          avgPts: r.player.avgPts != null ? r.player.avgPts : null,
+          dataConfidence: r.player.dataConfidence || null,
+          dataGames: r.player.dataGames != null ? r.player.dataGames : null,
+          statsBreakdown: r.player.statsBreakdown || null
         })),
       reasoning: describeLineup(built)
     }));
@@ -2825,12 +2892,93 @@ function weatherBadgesHtml(p){
   ).join('');
 }
 
+// A player's row-of-numbers popup data, embedded as an HTML-attribute-safe
+// JSON blob (added 2026-09-19) — event delegation (see below) reads this
+// back with JSON.parse(btn.getAttribute(...)), which gets the un-escaped
+// string automatically since the browser decodes HTML entities in attribute
+// values on the way out, the same &quot; trick weatherBadgesHtml() already
+// uses for its tooltip text.
+function playerStatsAttr(p){
+  const payload = {
+    name: p.name, team: p.team, opponent: p.opponent, isHome: p.isHome,
+    salary: p.salary, projPts: p.projPts, avgPts: p.avgPts,
+    dataConfidence: p.dataConfidence, dataGames: p.dataGames,
+    statsBreakdown: p.statsBreakdown
+  };
+  return JSON.stringify(payload).replace(/"/g, '&quot;');
+}
+
+const STATS_SOURCE_LABEL = {
+  recent: 'Based on the last 4 games — a real recent-form sample, weighted most heavily.',
+  blend: "Blended: this season's average so far, phased in as more games are played, mixed with last season's per-game rate.",
+  current: "This season's average only — no usable prior-season data was found for this player.",
+  prior: 'No current-season games yet — this is entirely last season’s per-game average.'
+};
+
+function confidenceLabel(conf, games){
+  games = games || 0;
+  if(conf === 'good') return 'Good confidence (' + games + ' game' + (games === 1 ? '' : 's') + ' this season)';
+  if(games > 0) return 'Thin confidence — only ' + games + ' game' + (games === 1 ? '' : 's') + ' this season so far';
+  return 'Thin confidence — no current-season games yet';
+}
+
+// Content for the per-player "prior stats" popup — shows the season/recent/
+// prior-year averages that fed into the one blended number the roster table
+// already shows, so a click answers "what is this projection actually based
+// on?" instead of just restating the projection.
+function playerStatsPopupHtml(p){
+  const bd = p.statsBreakdown || {};
+  const rows = [
+    ['This season', bd.curGames ? (bd.curAvg + ' avg over ' + bd.curGames + ' game' + (bd.curGames === 1 ? '' : 's')) : 'No games yet'],
+  ];
+  if(bd.recentGames) rows.push(['Last 4 games', bd.recentAvg + ' avg over ' + bd.recentGames + ' game' + (bd.recentGames === 1 ? '' : 's')]);
+  rows.push(['Last season', bd.prevGames ? (bd.prevAvg + ' avg over ' + bd.prevGames + ' game' + (bd.prevGames === 1 ? '' : 's')) : 'No data found']);
+  rows.push(['Used for projection', p.avgPts != null ? (p.avgPts + ' avg') : '—']);
+
+  const matchup = p.opponent ? matchupLabel(p) : '';
+  return (
+    '<div class="psTitle display">' + escapeHtml(p.name || '') + '</div>' +
+    '<div class="psSub">' + escapeHtml(p.team || '') + (matchup ? ' ' + escapeHtml(matchup) : '') +
+      (p.salary != null ? ' · $' + Number(p.salary).toLocaleString() : '') +
+      (p.projPts != null ? ' · ' + p.projPts + ' proj pts' : '') + '</div>' +
+    rows.map(r => '<div class="psRow"><div class="psLabel">' + escapeHtml(r[0]) + '</div><div class="psVal">' + escapeHtml(String(r[1])) + '</div></div>').join('') +
+    '<div class="psNote">' + escapeHtml(confidenceLabel(p.dataConfidence, p.dataGames)) + '. ' + escapeHtml(STATS_SOURCE_LABEL[bd.source] || '') + '</div>'
+  );
+}
+
+function openPlayerStatsPopup(p){
+  document.getElementById('playerStatsBody').innerHTML = playerStatsPopupHtml(p);
+  document.getElementById('playerStatsPopup').hidden = false;
+}
+function closePlayerStatsPopup(){
+  document.getElementById('playerStatsPopup').hidden = true;
+}
+document.getElementById('playerStatsCloseBtn').addEventListener('click', closePlayerStatsPopup);
+document.getElementById('playerStatsPopup').addEventListener('click', (e) => {
+  if(e.target.id === 'playerStatsPopup') closePlayerStatsPopup(); // backdrop click, not the card itself
+});
+document.addEventListener('keydown', (e) => {
+  if(e.key === 'Escape') closePlayerStatsPopup();
+});
+// Delegated on document rather than resultsArea/histDetail individually,
+// since lineupCardHtml() output gets replaced wholesale on every render
+// (Generate tab and History tab both use it) — one listener here survives
+// every re-render without needing to be re-attached.
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('.playerNameBtn');
+  if(!btn) return;
+  try{
+    openPlayerStatsPopup(JSON.parse(btn.getAttribute('data-stats')));
+  } catch(err){ /* malformed/missing data-stats — just don't open anything */ }
+});
+
 function lineupCardHtml(lu){
   const rows = (lu.players || []).map(p => (
     '<tr><td class="slot">' + (p.slot||'') + '</td>' +
     '<td><div style="display:flex; align-items:center; gap:8px;">' +
       '<img src="' + teamLogoUrl(p.team) + '" alt="" style="width:20px; height:20px; object-fit:contain; flex-shrink:0;" onerror="this.style.display=\'none\'">' +
-      '<span>' + (p.name||'') + (p.team ? ' <span style="color:var(--muted)">' + p.team + (p.opponent ? ' ' + matchupLabel(p) : '') + '</span>' : '') + weatherBadgesHtml(p) + '</span>' +
+      '<span><button type="button" class="playerNameBtn" data-stats="' + playerStatsAttr(p) + '">' + escapeHtml(p.name||'') + '</button>' +
+      (p.team ? ' <span style="color:var(--muted)">' + p.team + (p.opponent ? ' ' + matchupLabel(p) : '') + '</span>' : '') + weatherBadgesHtml(p) + '</span>' +
     '</div></td>' +
     '<td class="sal nums">$' + Number(p.salary||0).toLocaleString() + '</td>' +
     '<td class="pts nums">' + (p.projPts != null ? p.projPts : '') + '</td></tr>'
