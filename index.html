@@ -61,6 +61,82 @@
   .layout{ display:grid; grid-template-columns: 340px 1fr; gap: 20px; align-items:start; }
   @media (max-width: 780px){ .layout{ grid-template-columns: 1fr; } }
 
+  /* Mobile pass (2026-09-19), requested so this is usable straight from a
+     phone: tighter spacing/type at narrow widths, no horizontal scroll on
+     the page itself (the roster table gets its own scroll container
+     instead, see .rosterScroll below), and 16px-minimum form inputs so iOS
+     Safari doesn't auto-zoom the page on focus. 480px covers the common
+     phone-portrait range; .layout's own 780px breakpoint above already
+     handles tablet-and-down stacking. */
+  @media (max-width: 480px){
+    .wrap{ padding: 14px 12px 40px; }
+    header.top .title{ font-size: 24px; }
+    header.top .sub{ font-size: 12px; }
+    nav.tabs button{ padding: 8px 12px; font-size: 13px; }
+    .panel{ padding: 14px; }
+    .row2{ grid-template-columns: 1fr; gap: 0; }
+    .field input[type=text], .field input[type=password], .field input[type=number], .field select, .field textarea{ font-size: 16px; }
+    .lineupCard .lcHead{ padding: 10px 12px; flex-wrap: wrap; gap: 8px; }
+    .lineupCard .lcHead .stats{ gap: 14px; }
+    .lineupCard .lcHead .stat .n{ font-size: 18px; }
+    table.roster{ font-size: 12.5px; }
+    table.roster td, table.roster th{ padding: 6px 8px; }
+    .statusDetailRow{ flex-direction: column; gap: 3px; }
+    .statusDetailRow .sdLabel{ flex: 0 0 auto; }
+  }
+
+  /* Roster table horizontal-scroll safety net — the table itself shrinks
+     comfortably down to phone width via the media query above, but this
+     keeps a very long team/matchup string from ever clipping content
+     instead of just scrolling for it. */
+  .rosterScroll{ overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+  /* Collapsible "Advanced: connection settings" — added 2026-09-19 so the
+     Proxy URL / Draft group proxy URL fields (which used to sit open at
+     the very top of the page, in plain text) aren't the first thing a
+     mobile visit shows or the first thing visible in a screenshot. Collapsed
+     by default; the fields inside are type="password" with a show/hide
+     toggle so even opening this panel doesn't put the raw URL on screen
+     until asked for. This is a visibility/screenshot safeguard, not real
+     access control by itself — see the login-gate note near the top of the
+     script block below for the actual secrecy mechanism. */
+  details.advancedPanel{ border: 1px solid var(--line); border-radius: 2px; margin-bottom: 14px; }
+  details.advancedPanel summary{
+    padding: 10px 12px; cursor: pointer; font-size: 12.5px; color: var(--muted);
+    list-style: none; display:flex; align-items:center; gap:6px; user-select:none;
+  }
+  details.advancedPanel summary::-webkit-details-marker{ display:none; }
+  details.advancedPanel summary::before{ content: '▸'; color: var(--gold); transition: transform 0.15s ease; }
+  details.advancedPanel[open] summary::before{ transform: rotate(90deg); }
+  details.advancedPanel .advancedBody{ padding: 4px 14px 14px; border-top: 1px solid var(--line); }
+  .secretField{ position: relative; }
+  .secretField input{ padding-right: 46px !important; }
+  .secretField .secretToggle{
+    position:absolute; right:6px; top:50%; transform:translateY(-50%);
+    background:transparent; border:none; color:var(--muted); font-size:11px; cursor:pointer;
+    padding:6px 8px; text-decoration:underline; text-underline-offset:2px;
+  }
+
+  /* Login gate — a full-viewport overlay shown until this device has
+     unlocked (or was already unlocked in a prior visit, per localStorage).
+     See the script block below for what "unlock" actually checks. */
+  #lockScreen{
+    position: fixed; inset: 0; background: var(--bg); z-index: 1000;
+    display:flex; align-items:center; justify-content:center; padding: 20px;
+  }
+  #lockScreen .lockCard{
+    background: var(--panel); border: 1px solid var(--line); border-radius: 2px;
+    padding: 28px 24px; max-width: 340px; width: 100%; text-align:center;
+  }
+  #lockScreen .lockTitle{ font-size: 22px; margin-bottom: 6px; }
+  #lockScreen .lockSub{ color: var(--muted); font-size: 13px; margin-bottom: 18px; line-height:1.4; }
+  #lockScreen input{
+    width:100%; background: var(--panel-2); border: 1px solid var(--line); color: var(--chalk);
+    padding: 12px 12px; border-radius: 2px; font-size: 16px; text-align:center;
+    letter-spacing: 0.08em; margin-bottom: 12px;
+  }
+  #lockScreen .lockError{ color: var(--rust); font-size: 12.5px; margin-bottom: 10px; min-height: 1.2em; }
+
   .panel{
     background: var(--panel);
     border: 1px solid var(--line);
@@ -69,7 +145,7 @@
   }
   .field{ margin-bottom: 14px; }
   .field label{ display:block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
-  .field input[type=text], .field input[type=number], .field select, .field textarea{
+  .field input[type=text], .field input[type=password], .field input[type=number], .field select, .field textarea{
     width: 100%; background: var(--panel-2); border: 1px solid var(--line); color: var(--chalk);
     padding: 9px 10px; border-radius: 2px; font-size: 14px; resize: vertical;
   }
@@ -183,19 +259,31 @@
   <section id="genView">
     <div class="layout">
       <div class="panel">
-        <div class="field">
-          <label for="proxyUrl">Proxy URL <span style="color:var(--muted); font-weight:400;">(needed for the slate/pool data)</span></label>
-          <input type="text" id="proxyUrl" placeholder="https://your-worker.your-subdomain.workers.dev">
-          <div style="font-size:11px; color:var(--muted); margin-top:4px;">Routes DraftKings calls through your own Cloudflare Worker, avoiding CORS blocks. Lineup generation itself now runs entirely in your browser — free, no API key needed.</div>
-        </div>
-        <div class="field">
-          <label for="draftGroupProxyUrl">Draft group proxy URL <span style="color:var(--muted); font-weight:400;">(optional override, just for the player pool)</span></label>
-          <input type="text" id="draftGroupProxyUrl" placeholder="Leave blank to use the Proxy URL above for everything">
-          <div style="font-size:11px; color:var(--muted); margin-top:4px;">DraftKings' player-pool endpoint (api.draftkings.com/draftgroups) blocks Cloudflare Workers specifically, even with a real Worker proxy in front of it. If that's biting you (player pool errors with everything else working), point this at a separate small Node.js service instead — everything else still goes through the Proxy URL above.</div>
-        </div>
-        <div class="field">
-          <input type="hidden" id="apiKey" value="">
-        </div>
+        <details class="advancedPanel" id="advancedPanel">
+          <summary>Advanced: connection settings</summary>
+          <div class="advancedBody">
+            <div class="field">
+              <label for="proxyUrl">Proxy URL <span style="color:var(--muted); font-weight:400;">(needed for the slate/pool data)</span></label>
+              <div class="secretField">
+                <input type="password" id="proxyUrl" placeholder="https://your-worker.your-subdomain.workers.dev" autocomplete="off">
+                <button type="button" class="secretToggle" data-target="proxyUrl">show</button>
+              </div>
+              <div style="font-size:11px; color:var(--muted); margin-top:4px;">Routes DraftKings calls through your own Cloudflare Worker, avoiding CORS blocks. Lineup generation itself now runs entirely in your browser — free, no API key needed.</div>
+            </div>
+            <div class="field">
+              <label for="draftGroupProxyUrl">Draft group proxy URL <span style="color:var(--muted); font-weight:400;">(optional override, just for the player pool)</span></label>
+              <div class="secretField">
+                <input type="password" id="draftGroupProxyUrl" placeholder="Leave blank to use the Proxy URL above for everything" autocomplete="off">
+                <button type="button" class="secretToggle" data-target="draftGroupProxyUrl">show</button>
+              </div>
+              <div style="font-size:11px; color:var(--muted); margin-top:4px;">DraftKings' player-pool endpoint (api.draftkings.com/draftgroups) blocks Cloudflare Workers specifically, even with a real Worker proxy in front of it. If that's biting you (player pool errors with everything else working), point this at a separate small Node.js service instead — everything else still goes through the Proxy URL above.</div>
+            </div>
+            <div class="field">
+              <input type="hidden" id="apiKey" value="">
+            </div>
+            <button type="button" id="forgetDeviceBtn" class="btn ghost" style="font-size:11px;">Forget saved connection on this device</button>
+          </div>
+        </details>
         <div class="field">
           <label for="weekLabel">Slate label</label>
           <input type="text" id="weekLabel" placeholder="Pick a slate below to fill this in">
@@ -272,7 +360,7 @@
        this against what's live to confirm a deploy actually landed before
        chasing a "the fix didn't work" report as a logic bug. -->
   <div style="text-align:center; font-size:11px; color:var(--muted); opacity:0.6; padding:16px 0 8px;">
-    build 2026-09-19.5
+    build 2026-09-19.6
   </div>
 </div>
 
@@ -336,6 +424,34 @@ function getDraftGroupProxyUrl(){
   const override = document.getElementById('draftGroupProxyUrl').value.trim().replace(/\/$/, '');
   return override || getProxyUrl();
 }
+
+// Show/hide toggles for the password-masked connection fields inside
+// "Advanced: connection settings" (added 2026-09-19) — purely visual, so
+// opening the panel to check/edit a URL doesn't put it on screen (and in
+// any screenshot) by default.
+document.querySelectorAll('.secretToggle').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const input = document.getElementById(btn.dataset.target);
+    if(!input) return;
+    const revealed = input.type === 'text';
+    input.type = revealed ? 'password' : 'text';
+    btn.textContent = revealed ? 'show' : 'hide';
+  });
+});
+
+// "Forget saved connection on this device" — clears the locally-cached
+// proxy URLs (and, once the login gate below is wired up, re-locks the
+// app) so a shared or borrowed device doesn't keep them around.
+document.getElementById('forgetDeviceBtn').addEventListener('click', () => {
+  if(!confirm('Remove the saved Proxy URL and Draft group proxy URL from this device? You\'ll need to re-enter them (or log in again) next time.')) return;
+  try{
+    localStorage.removeItem('dfs-proxy-url');
+    localStorage.removeItem('dfs-draftgroup-proxy-url');
+  } catch(e){}
+  document.getElementById('proxyUrl').value = '';
+  document.getElementById('draftGroupProxyUrl').value = '';
+  location.reload();
+});
 
 function switchTab(tab){
   if(tab === 'gen'){
@@ -2684,7 +2800,7 @@ function lineupCardHtml(lu){
           '<div class="stat"><div class="n nums">' + (lu.totalProjPts != null ? lu.totalProjPts : '—') + '</div><div class="l">Proj Pts</div></div>' +
         '</div>' +
       '</div>' +
-      '<table class="roster"><thead><tr><th>Slot</th><th>Player</th><th>Salary</th><th>Proj</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+      '<div class="rosterScroll"><table class="roster"><thead><tr><th>Slot</th><th>Player</th><th>Salary</th><th>Proj</th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
       (lu.reasoning ? '<div class="reasoning">' + lu.reasoning + '</div>' : '') +
     '</div>'
   );
