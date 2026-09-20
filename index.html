@@ -377,7 +377,7 @@
        this against what's live to confirm a deploy actually landed before
        chasing a "the fix didn't work" report as a logic bug. -->
   <div style="text-align:center; font-size:11px; color:var(--muted); opacity:0.6; padding:16px 0 8px;">
-    build 2026-09-19.9
+    build 2026-09-20.2
   </div>
 </div>
 
@@ -1082,6 +1082,7 @@ function computeProjections(pool){
 
   pool.forEach(p => {
     const baseline = baselineProjection(p);
+    p.noRoleDiscount = false;
 
     // "Hard" injury news is handled first and separately from everything
     // else below — a genuine Out/Doubtful should zero out or heavily
@@ -1147,6 +1148,28 @@ function computeProjections(pool){
       if(teamsAtPos >= 4 && posFloor != null && p.salary <= posFloor + 600 &&
          pricierTeammates.length >= 2 && isCheapestOnTeam && allPricierTeammatesHealthy){
         p.proj = Math.round(baseline * 0.2 * 10) / 10;
+        return;
+      }
+
+      // No-role check (added 2026-09-20, Theo Wease Jr. / Chargers practice
+      // squad): the buried-teammate rule above is purely salary-based and
+      // can't see roster status at all. This one uses an independent signal —
+      // his team has already played this season, yet he has zero offensive
+      // snaps AND zero current-season games in the box-score data — combined
+      // with floor-level DraftKings pricing. Two separate data sources
+      // agreeing, plus the price, keeps a real starter from being caught by a
+      // name-matching miss in just one of them.
+      // Deliberately the EXACT price floor, not the +$600
+      // band the buried-teammate rule uses. Checked against the real
+      // 2026-09-20 pool: a wider band also caught Alvin Kamara ($4,600, RB) —
+      // a healthy-again veteran who was simply inactive in Week 1 (knee,
+      // full practice by Friday). DraftKings prices a genuine no-role body
+      // at exactly the floor; anyone priced even a little above it is one
+      // DK thinks could matter, and "missed last week" alone isn't enough
+      // to override that.
+      if(p.noSeasonSnaps && !(p.dataGames > 0) && posFloor != null && p.salary <= posFloor){
+        p.proj = Math.round(baseline * 0.2 * 10) / 10;
+        p.noRoleDiscount = true;
         return;
       }
     }
@@ -1755,6 +1778,68 @@ async function fetchInjuryPracticeData(){
 // snap share is climbing recently can be a much better bet than a flat
 // season average would suggest (and vice versa for a shrinking role).
 let snapTrendCache = null;
+
+// Season-level "has this player actually played offense yet?" picture, built
+// from the same snap-count rows as the trend above (added 2026-09-20 after
+// Theo Wease Jr. — a Chargers PRACTICE SQUAD receiver, on no active roster —
+// showed up in an Optimal lineup at 10.3 projected points). Nothing in the
+// pipeline knew roster status: his only stats were one big game last year,
+// DraftKings prices practice-squad bodies at the salary floor like any other
+// scrub, and the salary-only "buried teammate" discount can't fire when
+// several teammates are tied at that same floor. Snap counts only contain
+// rows for players who were on a game-day roster, so a cheap RB/WR/TE whose
+// team HAS played but who has no offensive snaps at all is a strong
+// "not part of this offense right now" signal that doesn't depend on
+// salary spacing.
+//
+// Team abbreviations differ between sources (real data 2026-09-20: nflverse
+// snap counts label the Rams "LA"; DraftKings uses "LAR"), so both sides go
+// through snapTeamKey(). A team we can't find in the snap data means "no
+// evidence either way" and never triggers the discount.
+let snapSeasonMeta = null; // { teams: Set of team keys, offenseKeys: Set of normalized names }
+const SNAP_TEAM_ALIASES = { LA: 'LAR', STL: 'LAR', WSH: 'WAS', JAC: 'JAX', OAK: 'LV', SD: 'LAC' };
+function snapTeamKey(t){
+  const u = String(t || '').trim().toUpperCase();
+  return SNAP_TEAM_ALIASES[u] || u;
+}
+// Same-team + last-name + first-initial fallback for nickname mismatches
+// between DraftKings and PFR (real case in the 2026-09-20 data: DK "Kenny
+// Gainwell" vs. PFR "Kenneth Gainwell"). Without it a real player with a
+// nickname would look like he has no snaps. The error direction is safe: a
+// rare collision just means NOT discounting someone.
+function snapLooseKey(team, name){
+  const parts = normalizePlayerName(name).split(' ').filter(Boolean);
+  if(parts.length < 2) return null;
+  return snapTeamKey(team) + '|' + parts[parts.length - 1] + '|' + parts[0][0];
+}
+function buildSnapSeasonMeta(rows){
+  const teams = new Set();
+  const offenseKeys = new Set();
+  const offenseLooseKeys = new Set();
+  (rows || []).forEach(r => {
+    if(!r || !r.player || isNaN(Number(r.week))) return;
+    if(r.team) teams.add(snapTeamKey(r.team));
+    const snaps = Number(r.offense_snaps);
+    const pct = Number(r.offense_pct);
+    // A row with 0 offensive snaps (special-teams-only, e.g. a depth WR who
+    // dressed but never lined up on offense) does not count as having played offense.
+    if(snaps > 0 || (isNaN(snaps) && pct > 0)){
+      offenseKeys.add(normalizePlayerName(r.player));
+      const lk = snapLooseKey(r.team, r.player);
+      if(lk) offenseLooseKeys.add(lk);
+    }
+  });
+  return { teams, offenseKeys, offenseLooseKeys };
+}
+function hasNoSeasonOffenseSnaps(p, meta){
+  if(!meta || !p || !p.team || !p.name) return false;
+  if(!meta.teams.has(snapTeamKey(p.team))) return false; // team hasn't shown up in the snap data yet
+  if(meta.offenseKeys.has(normalizePlayerName(p.name))) return false;
+  const lk = snapLooseKey(p.team, p.name);
+  if(lk && meta.offenseLooseKeys && meta.offenseLooseKeys.has(lk)) return false;
+  return true;
+}
+
 async function fetchSnapCountTrends(){
   if(snapTrendCache) return snapTrendCache;
   const proxy = getProxyUrl();
@@ -1769,6 +1854,8 @@ async function fetchSnapCountTrends(){
     const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
     const rows = parsed.data || [];
     if(!rows.length) throw new Error('CSV came back empty.');
+
+    snapSeasonMeta = buildSnapSeasonMeta(rows);
 
     const byPlayer = {};
     rows.forEach(r => {
@@ -2792,6 +2879,7 @@ async function generateLineups(){
       pool.forEach(p => {
         const key = normalizePlayerName(p.name);
         if(snapTrends[key]) p.snapTrend = snapTrends[key].trend;
+        p.noSeasonSnaps = hasNoSeasonOffenseSnaps(p, snapSeasonMeta);
       });
 
       const opportunityTrends = await fetchOpportunityTrends();
@@ -2801,6 +2889,18 @@ async function generateLineups(){
       });
     }
     computeProjections(pool);
+
+    // Make the no-role discount visible (same lesson as the weather badges:
+    // a check that silently does nothing looks identical to one that never
+    // ran, and a discounted player never appears in a lineup to be noticed).
+    if(endpointStatus.snaps && endpointStatus.snaps.state === 'ok'){
+      const noRole = pool.filter(p => p.noRoleDiscount);
+      const base = String(endpointStatus.snaps.detail || '').split(' Discounted ')[0];
+      const names = noRole.slice(0, 8).map(p => p.name + ' (' + p.team + ')').join(', ') + (noRole.length > 8 ? ', …' : '');
+      setEndpointStatus('snaps', 'ok', base + (noRole.length
+        ? ' Discounted ' + noRole.length + ' floor-priced RB/WR/TE with no offensive snaps or games this season (likely practice squad/inactive): ' + names + '.'
+        : ' No floor-priced RB/WR/TE flagged as having no current-season role.'));
+    }
 
     const activeSlate = slatesCache.find(s => String(s.draftGroupId) === String(activeDraftGroupId));
     const isShowdown = activeSlate && activeSlate.kind === 'showdown';
